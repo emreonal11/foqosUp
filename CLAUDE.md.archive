@@ -1,0 +1,449 @@
+# MyBrick - Development Guidelines
+
+## Project Context
+
+**What This Is**: DIY app/website blocker for iPhone & iPad using NFC tag (Brick device) as physical lock/unlock trigger. Blocks distracting apps across devices for you and your girlfriend.
+
+**Key Architectural Decisions**:
+- ✅ **iOS/iPad only** (macOS has no Screen Time API, /etc/hosts unreliable for HSTS sites)
+- ✅ **Fork Foqos** (open-source app with Screen Time API already integrated)
+- ✅ **iCloud sync** for iPhone ↔ iPad state (NSUbiquitousKeyValueStore)
+- ✅ **Reprogram existing Brick** NFC tag (confirmed feasible)
+- ✅ **Multi-user support** (separate Apple IDs = independent blocking)
+- ✅ **Emergency unbrick** (passcode-based escape hatch)
+
+**Critical Constraints**:
+- Screen Time API limitations: Opaque tokens, 50 app limit, iOS 16+ only
+- iCloud KV sync: 10-20s typical latency, 1MB total storage, unreliable under heavy load
+- ManagedSettings local-only (must manually apply blocks on each device after iCloud sync)
+- NFC reading requires user initiation (foreground session, can't auto-scan)
+
+---
+
+## Development Workflow
+
+### Research → Plan → Implement
+
+**1. Research Phase (NEVER SKIP)**
+- Read existing Foqos codebase before modifying
+- Understand Screen Time API patterns (FamilyControls, ManagedSettings, DeviceActivity)
+- Don't duplicate logic that already exists in Foqos
+
+**2. Planning Phase**
+- For complex changes: Outline plan before coding
+- Validate assumptions about iCloud sync behavior
+- Consider edge cases (offline, sync failures, emergency unbrick)
+
+**3. Implementation Phase**
+- Follow the plan
+- Test incrementally (don't build everything then test)
+- Validate on both iPhone and iPad after each feature
+
+---
+
+## Critical Rules
+
+### Focus & Simplicity
+- **Build only what's needed** - Don't add features beyond requirements
+- **Simple > Complex** - Choose clarity over cleverness
+- **Stop and reassess** - If frequently changing approach, likely overcomplicating
+- **No over-engineering** - Error handling only for scenarios that can actually happen
+
+### Code Quality
+- **No hardcoded values** - Use constants or configuration
+- **DRY principle** - Reuse existing Foqos code, don't duplicate
+- **Clear naming** - `toggleBlocking()` not `doThing()`
+- **Comments only where non-obvious** - Code should be self-documenting
+
+### Testing
+- **Test on device** - Simulator doesn't support NFC or Screen Time API
+- **Test offline scenarios** - Airplane mode should still block locally
+- **Test multi-device** - iPhone changes must sync to iPad
+- **Test emergency unbrick** - Critical safety feature
+
+---
+
+## Screen Time API Patterns
+
+### Authorization (One-Time)
+```swift
+// Request Family Controls authorization
+await AuthorizationCenter.shared.requestAuthorization()
+```
+
+### App Selection
+```swift
+// Use Apple's picker (returns opaque tokens)
+let selection = FamilyActivitySelection()
+// User selects apps via system UI
+```
+
+### Apply Blocking
+```swift
+// ManagedSettings applies blocks locally (per-device)
+let store = ManagedSettingsStore()
+store.shield.applications = selection.applicationTokens  // Block
+store.shield.applications = nil  // Unblock
+```
+
+### Critical Notes
+- **Opaque tokens**: Can't inspect which apps selected, must store entire selection
+- **Local only**: ManagedSettings don't sync automatically, you must sync via iCloud KV
+- **50 app limit**: Use "allow mode" (block all except 50) if blocking > 50 apps
+
+---
+
+## iCloud Sync Patterns
+
+### Setup
+```swift
+// Enable in Xcode: Signing & Capabilities → iCloud → Key-value storage
+let iCloud = NSUbiquitousKeyValueStore.default
+```
+
+### Write State
+```swift
+iCloud.set(true, forKey: "isBlocked")
+iCloud.synchronize()  // Force immediate sync
+```
+
+### Listen for Changes
+```swift
+NotificationCenter.default.addObserver(
+    self,
+    selector: #selector(iCloudChanged),
+    name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
+    object: iCloud
+)
+```
+
+### Critical Notes
+- **Sync latency**: 10-20s typical, minutes if rate-limited
+- **1MB limit**: Entire KV store across all keys
+- **Last-write-wins**: No custom conflict resolution
+- **Reliability**: Has documented production issues, add fallback logic
+
+---
+
+## NFC Tag Patterns
+
+### Read Tag
+```swift
+let session = NFCNDEFReaderSession(delegate: self, queue: nil, invalidateAfterFirstRead: false)
+session.begin()
+
+func readerSession(_ session: NFCNDEFReaderSession, didDetect tags: [NFCNDEFTag]) {
+    let tag = tags.first!
+    session.connect(to: tag) { error in
+        tag.readNDEF { message, error in
+            let text = String(data: message.records.first!.payload, encoding: .utf8)
+            // Process tag data
+        }
+    }
+}
+```
+
+### Write Tag
+```swift
+let payload = NFCNDEFPayload.wellKnownTypeTextPayload(
+    string: "UNIFIED_BLOCKER_V1",
+    locale: Locale(identifier: "en")
+)
+let message = NFCNDEFMessage(records: [payload])
+tag.writeNDEF(message) { error in ... }
+```
+
+### Critical Notes
+- **Foreground only**: User must initiate NFC scan (can't auto-scan in background)
+- **Tag types**: NTAG213/215/216 supported (Type 2 NDEF)
+- **Reprogrammable**: Unless explicitly locked
+- **iPhone 7+**: NFC support required
+
+---
+
+## Multi-User Architecture
+
+### Isolation Strategy
+- **Separate Apple IDs** = separate iCloud KV stores
+- **Shared NFC tag** = passive device, each phone reads independently
+- **Independent blocklists** = you block Instagram, she blocks TikTok
+- **No cross-contamination** = your scan doesn't affect her devices
+
+### Data Flow
+```
+Your iPhone → Your iCloud → Your iPad
+  (Apple ID: you@gmail.com)
+
+Her iPhone → Her iCloud → Her iPad
+  (Apple ID: gf@gmail.com)
+
+Same Brick NFC Tag (shared physical device)
+```
+
+---
+
+## Error Handling
+
+### Graceful Degradation
+```swift
+// iCloud sync failure? Work locally
+@objc private func iCloudChanged() {
+    do {
+        loadFromiCloud()
+        applyBlocking()
+    } catch {
+        // Fallback: Use last known state
+        print("iCloud sync failed, using local state")
+    }
+}
+```
+
+### User-Facing Errors
+```swift
+// Show clear, actionable messages
+session.invalidate(errorMessage: "Tag not recognized. Re-scan Brick.")
+```
+
+### Emergency Safety
+```swift
+// Always provide escape hatch
+func emergencyUnbrick(passcode: String) -> Bool {
+    guard passcode == storedPIN else { return false }
+    // Unbrick immediately, sync to other devices
+}
+```
+
+---
+
+## Testing Guidelines
+
+### Device Testing (Critical)
+- ❌ **Simulator won't work** (no NFC, no Screen Time API)
+- ✅ **Test on real iPhone** (USB deployment)
+- ✅ **Test on real iPad** (verify sync)
+
+### Test Scenarios
+1. **Happy path**: Scan → block → scan → unblock
+2. **Sync validation**: iPhone blocks → iPad blocks within 30s
+3. **Offline mode**: Airplane mode → blocks still work locally
+4. **Emergency**: Passcode unbrick works on all devices
+5. **Multi-user**: Her scan doesn't affect your devices
+
+### Validation Checklist
+- [ ] Apps block immediately on scan
+- [ ] Shield screen appears when opening blocked app
+- [ ] iPad syncs from iPhone
+- [ ] Emergency PIN works
+- [ ] Offline blocking persists
+
+---
+
+## Documentation Standards
+
+### Keep It Simple
+- **One file per topic** (no duplication)
+- **Code examples** (runnable, self-contained)
+- **Clear headings** (scannable structure)
+- **No verbose explanations** (concise, jargon-free)
+
+### Update After Changes
+- README.md - User-facing guide, architecture overview
+- Implementation details in code comments
+- No speculative docs (don't document what doesn't exist yet)
+
+---
+
+## Collaboration Patterns
+
+### When Stuck
+1. **Stop** - Don't spiral into complexity
+2. **Ask** - "I see approaches [A] vs [B]. Which fits better?"
+3. **Simplify** - Simpler solution usually correct
+
+### Progress Communication
+```
+✓ NFC tag reprogrammed successfully
+✓ SyncManager implemented, compiles
+✗ iPad not receiving updates - investigating iCloud entitlement
+```
+
+### Suggesting Improvements
+"The current approach works, but I notice [observation].
+Would you like me to [improvement]? This would [benefit]."
+
+---
+
+## Common Pitfalls
+
+### Avoid These Mistakes
+
+**1. Assuming ManagedSettings Sync**
+- ❌ WRONG: "iCloud will sync blocks automatically"
+- ✅ CORRECT: "iCloud syncs state, must manually apply to each device's ManagedSettings"
+
+**2. Forgetting Offline Mode**
+- ❌ WRONG: Require iCloud for all operations
+- ✅ CORRECT: Blocks work locally, sync when online
+
+**3. Over-Engineering Multi-User**
+- ❌ WRONG: Build complex user profile system
+- ✅ CORRECT: Separate Apple IDs = natural isolation
+
+**4. Ignoring Emergency Escape**
+- ❌ WRONG: No way to unbrick if Brick is lost
+- ✅ CORRECT: Passcode-based emergency unbrick
+
+**5. Hardcoding Emergency PIN**
+- ❌ WRONG: `if passcode == "1234"`
+- ✅ CORRECT: `UserDefaults.standard.string(forKey: "emergencyPIN")`
+
+---
+
+## Development Environment
+
+### Prerequisites
+- macOS with Xcode 15+
+- Apple Developer account (free tier works, 7-day certs)
+- iPhone 7+ for testing (Simulator won't work)
+- iPad for multi-device testing (optional but recommended)
+
+### Setup
+```bash
+cd ~/projects/mybrick
+git clone https://github.com/awaseem/foqos.git
+cd foqos
+open foqos.xcodeproj
+```
+
+### Build & Deploy
+```bash
+# In Xcode:
+# 1. Connect iPhone via USB
+# 2. Product → Run (Cmd+R)
+# 3. Trust developer on iPhone
+```
+
+---
+
+## Project Goals
+
+### MVP (Minimum Viable Product)
+- ✅ Scan Brick → iPhone blocks apps immediately
+- ✅ iPad syncs and blocks within 30 seconds
+- ✅ Scan again → both devices unblock
+- ✅ Emergency unbrick via passcode
+
+### Full Product
+- ✅ Girlfriend's devices work independently
+- ✅ Configurable blocklists (different apps per person)
+- ✅ Offline mode (local blocking when no iCloud)
+- ✅ Polished UX (haptics, status indicators)
+
+### Non-Goals (Out of Scope)
+- ❌ macOS support (too complex, unreliable)
+- ❌ Real-time sync (iCloud has inherent latency)
+- ❌ App Store distribution (requires $99/year, not needed)
+- ❌ Shared blocklists between users (each person independent)
+
+---
+
+## Technical Debt to Avoid
+
+### Don't Build These
+- Custom sync protocol (use iCloud KV, don't reinvent)
+- Complex user management (Apple IDs handle this)
+- Custom NFC protocol (use standard NDEF text)
+- Analytics/tracking (privacy-first, local-only)
+
+### Keep It Minimal
+- Total new code: ~150 lines
+- Reuse Foqos base: ~90% of functionality
+- No external dependencies beyond Apple frameworks
+- No backend services (everything local + iCloud)
+
+---
+
+## Success Metrics
+
+**Reliability**:
+- 95%+ success rate for iPhone blocking
+- 85%+ sync success iPhone → iPad
+- 100% offline blocking reliability
+
+**User Experience**:
+- < 1 second from NFC scan to block
+- < 30 seconds for iPad to sync
+- < 5 seconds for emergency unbrick
+
+**Maintainability**:
+- < 200 lines of custom code
+- No external dependencies
+- Clear separation of concerns (SyncManager, NFC, UI)
+
+---
+
+**Last Updated**: December 2025
+**Project Status**: Planning complete, ready for implementation
+**Estimated Effort**: 7 hours (single weekend)
+
+
+### Research Patterns
+
+**Before implementing:** read `SINGLE_PROMPT_APP_CONTEXT.md` first. For specific domains, read the relevant specialized docs — see `CLAUDE.md` for the doc hierarchy and `SINGLE_PROMPT_APP_CONTEXT.md` → "Documentation Map" for the complete list.
+
+**Codebase research:** Use the `Explore` agent for file/code searches (it cannot spawn sub-agents). For quick directed lookups, use Glob/Grep directly.
+
+**Web research — Research Subagent Pattern:** For any non-trivial external research (3+ search rounds, dense documents, or broad topic coverage), always spawn a `general-purpose` research subagent. All intermediate searching, fetching, and reasoning stays in the subagent's isolated context — only a compressed 2k–8k token synthesis returns to the parent. Without this isolation, a full research run accumulates 50k–150k tokens of noise in the main context.
+
+**What to give the subagent:** full task context + what you already know (avoid duplication) + desired output format.
+
+**Research workflow (runs inside the subagent):**
+1. **Discover** — 3–8 search calls; include 2–3 with semantically orthogonal formulations (different terminology, different angle — not just varied keywords on the same topic). Identify high-authority sources and candidate domains.
+   ```
+   Precise/technical or recency-sensitive?                → web_search
+   Conceptual/exploratory, no canonical keywords?         → web_search_advanced_exa
+   Academic papers?                                       → web_search_advanced_exa, category: "research paper"
+   Code implementations / how X is done in code?          → get_code_context_exa (not web_fetch on GitHub URLs)
+   Unclear which model wins?                              → use both
+   ```
+2. **Map** *(required when a high-authority domain has ≥3 likely-relevant pages, OR when about to extract from a 3rd URL on the same domain)* — `tavily_map` to enumerate available content before extraction; select highest-value URLs from the map. Direct-URL extraction without mapping is a pattern smell when a whole authoritative domain is in scope. No native equivalent.
+3. **Extract** — `tavily_extract` with `query` param for dense sources (long reports, docs, academic papers); `web_fetch` for simple pages (news, blog posts). For Exa-discovered pages, check highlights first — extract only if highlights are insufficient.
+4. **Gap-fill** — before each iteration, explicitly check: are there sub-questions from the original goal still unanswered? If the last iteration produced no new signal, stop regardless of count. Hard cap: 3 iterations.
+5. **Synthesise** — compile into structured cited report; flag contradictions between sources explicitly, trigger a targeted re-query to cross-reference conflicting claims, note unresolved contradictions rather than resolving silently. Include a methodology log separating queries into explicit iteration blocks (`Discover`, `Gap-fill — Iteration 1`, `Gap-fill — Iteration 2`, etc.); each block ends with one line: `Remaining gaps: [list]` OR `None — stopping`. Flat per-query lists without iteration markers are insufficient — coverage gate and exit criteria must be verifiable from the output.
+
+**For broad research with independent subtopics:** assess complexity and structure upfront from the task description before starting any searches. Parent spawns parallel research subagents (one per topic). Before spawning, verify: (1) scopes don't overlap (same domain, time period, or question angle) — undifferentiated scope is the leading cause of cross-agent duplication; (2) no multiple subtopics share a foundational prerequisite — if they do, resolve it once in parent context and include the findings in each subagent's prompt; (3) scope is roughly balanced across agents — one oversized subtopic dominates total wall time; (4) the partition spans the question's decision-relevant top-level axes, not just one — most broad questions live on multiple axes (e.g., for "X drift prevention": detection time = build/PR/runtime; method = deterministic/probabilistic; source = commercial/OSS/academic). Partitioning along one axis systematically misses findings on the others. Pick the most decision-relevant axis as the partition; if a second axis is also decision-relevant, extend at least one subagent's scope to sweep it (e.g., "operational/runtime variants of X") rather than relying on synthesis to retroactively notice the gap. Each subagent runs the full workflow in isolated context; only compressed syntheses return to parent.
+
+**Scaling heuristics (Anthropic production data):**
+
+| Research complexity | Structure |
+|---|---|
+| Simple fact-finding | 1 subagent, 3–10 tool calls |
+| Comparisons / technology evaluations | 2–4 parallel subagents, 10–15 calls each |
+| Complex multi-faceted research | 5–10 parallel subagents with clearly divided scope — returns diminish beyond this range |
+
+**Do not use diversity prompting** across parallel agents (giving agents intentionally different instructions to produce variety). Empirically counterproductive — agents should receive identical instruction structure with different scope assignments.
+
+**Search tool guidance:**
+
+| Tool | Use | Reason |
+|---|---|---|
+| `tavily_search` | Disabled — use `web_search` | Free (subscription), Claude-directed, project-context-aware |
+| `tavily_research` (all variants) | Disabled | Up to $2.00/call; no project context; no steering. Replaced by this workflow. |
+| `tavily_map` | Keep — conditional | Proactive domain enumeration, no native equivalent, ~$0.0008/page |
+| `tavily_extract` | Keep — dense sources only | Batch extraction + `query`-param relevance reranking within pages, ~$0.0016/URL |
+| `tavily_crawl` | Keep — see decision tree | Same traversal as map but returns content in one call |
+| `web_search_advanced_exa` | CONDITIONAL — all Exa searches (conceptual/exploratory + academic papers) | Multi-query deep search with neural embedding index; supports `category: "research paper"` for arxiv/paperswithcode filtering; 4–12s/call — acceptable inside research subagents; strictly better than basic `web_search_exa` at negligible cost difference |
+| `get_code_context_exa` | CONDITIONAL — code implementation research | Searches GitHub and code documentation. Prefer over `web_fetch` when investigating implementation context in specific repos — returns richer context including related implementations across the ecosystem |
+
+**`tavily_crawl` vs. `tavily_map` + `tavily_extract`:**
+```
+Need relevance reranking within pages?       → map + extract  (query param; only option)
+Already have the URLs?                       → extract directly
+Large site, want only a fraction of pages?   → map + filter + extract
+Unknown structure / want most content?       → crawl  (one call, NL instructions work)
+Multiple domains in one pass?                → extract  (crawl is single-root only)
+```
+
+**Subagent nesting:** Off by default (depth = 1). Enable `chat.subagents.allowInvocationsFromSubagents` for up to depth 5 if a research subagent needs to fan out further. Parent-orchestrated parallelism is sufficient for most cases.
+
+**When inline research is fine:** 1–2 quick lookups where spawning a subagent adds more overhead than it saves.

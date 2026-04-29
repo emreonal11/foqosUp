@@ -1,0 +1,132 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash",
+      "Bash(claude mcp:*)",
+      "mcp__sequential-thinking__sequentialthinking",
+      "mcp__tavily__tavily-search",
+      "mcp__exa__web_search_exa",
+      "Bash(python -m pytest tests/test_campaign_sheets.py::TestCampaignSheetCreation::test_create_campaign_with_sheets -v)",
+      "Bash(python -m pytest tests/test_campaign_sheets.py -v)",
+      "Bash(python -m pytest tests/test_campaign_sheets.py::TestDataValidation::test_campaign_data_accuracy -v -s)",
+      "Bash(python tests:*)",
+      "Bash(python -m tests.test_cleanup_utility:*)",
+      "Bash(grep:*)",
+      "Bash(python -m pytest tests/test_campaign_sheets.py::TestCampaignSheetCreation -v)",
+      "Bash(python -m pytest tests/test_campaign_sheets.py::TestCampaignSheetCreation::test_create_campaign_with_sheets -v -s)",
+      "Bash(python -m pytest tests/test_campaign_sheets.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_campaign_sheets.py::TestCampaignSheetCreation::test_campaigns_tracker_update -v -s)",
+      "Bash(python -m pytest tests/test_minimal_suite.py -v)",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__get-library-docs",
+      "Bash(chmod:*)",
+      "Bash(python test:*)",
+      "Bash(python:*)",
+      "Bash(curl:*)",
+      "Bash(lsof:*)",
+      "Bash(rm:*)",
+      "Bash(mv:*)",
+      "Bash(pkill:*)",
+      "Bash(mkdir:*)",
+      "Bash(true)",
+      "Bash(timeout 60s python:*)",
+      "Bash(timeout 90s python main.py:*)",
+      "Bash(timeout 120s python:*)",
+      "Bash(timeout:*)",
+      "mcp__exa__deep_researcher_start",
+      "mcp__exa__deep_researcher_check",
+      "Bash(npm create:*)",
+      "Bash(npm install)",
+      "Bash(npm run dev:*)",
+      "mcp__puppeteer__puppeteer_navigate",
+      "Bash(npm run build:*)",
+      "Bash(npm install:*)",
+      "Bash(npx tailwindcss:*)",
+      "Bash(npx shadcn-vue:*)",
+      "mcp__puppeteer__puppeteer_screenshot",
+      "mcp__puppeteer__puppeteer_click",
+      "Bash(pip install:*)",
+      "Bash(kill:*)",
+      "mcp__puppeteer__puppeteer_evaluate",
+      "Bash(find:*)",
+      "Bash(pgrep:*)",
+      "mcp__puppeteer__puppeteer_fill",
+      "Bash(ls:*)",
+      "Bash(sed:*)",
+      "Bash(./create_macos_installer.sh:*)",
+      "Bash(codesign:*)",
+      "Bash(pip3 install:*)",
+      "Bash(cp:*)",
+      "Bash(open:*)",
+      "Bash(\"/Users/emreonal/Desktop/Tessera.app/Contents/MacOS/Tessera\")",
+      "Bash(~/Desktop/Tessera.app/Contents/MacOS/Tessera)",
+      "Bash(cat:*)",
+      "mcp__tavily__tavily-extract",
+      "Bash(touch:*)",
+      "Bash(for f in config/*.json)",
+      "Bash(do echo -e \"\\n$f:\")",
+      "Bash(head:*)",
+      "Bash(done)",
+      "Bash"
+    ],
+    "deny": [
+      "Bash(git push:*)",
+      "Bash(git pull origin:*)",
+      "Bash(rm -rf /*)",
+      "Bash(sudo rm -rf:*)",
+      "Bash(chmod 777:*)",
+      "Bash(format:*)",
+      "Bash(mkfs:*)",
+      "Bash(dd:*)",
+      "Bash(shutdown:*)",
+      "Bash(reboot:*)",
+      "Bash(halt:*)",
+      "Bash(poweroff:*)",
+      "Bash(init:*)",
+      "Bash(killall:*)",
+      "Bash(sudo su:*)",
+      "Bash(passwd:*)",
+      "Bash(usermod:*)",
+      "Bash(userdel:*)",
+      "Bash(groupdel:*)",
+      "Bash(./scripts/deploy-prod.sh)",
+      "Bash(scripts/deploy-prod.sh)",
+      "Bash(cd ~/tessera/tessera-backend && ./scripts/deploy-prod.sh)",
+      "Bash(cd ~/tessera/tessera-frontend && ./scripts/deploy-frontend-prod.sh)",
+      "Bash(./scripts/deploy-frontend-prod.sh)",
+      "Bash(scripts/deploy-frontend-prod.sh)"
+    ]
+  },
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"$(.message)\" | terminal-notifier -title \"Claude Code\" -sound default"
+          },
+          {
+            "type": "command",
+            "command": "afplay /System/Library/Sounds/Ping.aiff"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"$(.message)\" | terminal-notifier -title \"Claude Code\" -sound default"
+          },
+          {
+            "type": "command",
+            "command": "afplay /System/Library/Sounds/Ping.aiff"
+          }
+        ]
+      }
+    ]
+  }
+}
