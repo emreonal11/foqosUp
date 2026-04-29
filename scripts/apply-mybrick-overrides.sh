@@ -2,18 +2,22 @@
 # Applies MyBrick personalization to a fresh clone of awaseem/foqos.
 # Idempotent: safe to run multiple times.
 #
+# Layout assumption: this script lives at <repo-root>/scripts/, and the
+# Foqos iOS source tree lives at <repo-root>/Foqos/. (Post-2026 reorg —
+# see CLAUDE.md history if confused.)
+#
 # Usage:
 #   bash scripts/apply-mybrick-overrides.sh
 #
 # When to run:
 #   - First-time setup on a fresh clone
-#   - After `git reset --hard upstream/main` to rebuild your personalization commit
+#   - After re-vendoring upstream Foqos into Foqos/ to rebuild personalization
 #
 # What it does:
-#   1. Replaces upstream bundle ID prefix with your prefix in pbxproj
-#   2. Replaces upstream development team with yours in pbxproj
+#   1. Replaces upstream bundle ID prefix in Foqos/foqos.xcodeproj/project.pbxproj
+#   2. Replaces upstream development team in same
 #   3. Replaces upstream app-group identifier in 4 entitlements files
-#   4. Replaces upstream app-group literal in Foqos/Models/Shared.swift
+#   4. Replaces upstream app-group literal in Foqos/Foqos/Models/Shared.swift
 
 set -euo pipefail
 
@@ -33,19 +37,19 @@ MYBRICK_APP_GROUP="group.com.usetessera.mybrick"
 sed -i '' \
   -e "s|${UPSTREAM_BUNDLE_PREFIX}|${MYBRICK_BUNDLE_PREFIX}|g" \
   -e "s|DEVELOPMENT_TEAM = ${UPSTREAM_TEAM};|DEVELOPMENT_TEAM = ${MYBRICK_TEAM};|g" \
-  foqos.xcodeproj/project.pbxproj
+  Foqos/foqos.xcodeproj/project.pbxproj
 
 # ─── 2. Entitlements: app-group identifier ────────────────────────────────────
 sed -i '' "s|${UPSTREAM_APP_GROUP}|${MYBRICK_APP_GROUP}|g" \
-  Foqos/foqos.entitlements \
-  FoqosDeviceMonitor/FoqosDeviceMonitor.entitlements \
-  FoqosShieldConfig/FoqosShieldConfig.entitlements \
-  FoqosWidget/FoqosWidgetExtension.entitlements
+  Foqos/Foqos/foqos.entitlements \
+  Foqos/FoqosDeviceMonitor/FoqosDeviceMonitor.entitlements \
+  Foqos/FoqosShieldConfig/FoqosShieldConfig.entitlements \
+  Foqos/FoqosWidget/FoqosWidgetExtension.entitlements
 
 # ─── 3. Shared.swift: app-group literal ───────────────────────────────────────
 sed -i '' "s|\"${UPSTREAM_APP_GROUP}\"|\"${MYBRICK_APP_GROUP}\"|g" \
-  Foqos/Models/Shared.swift
+  Foqos/Foqos/Models/Shared.swift
 
 echo "✓ MyBrick overrides applied."
 echo ""
-echo "Next: open foqos.xcodeproj in Xcode, build, and verify."
+echo "Next: open Foqos/foqos.xcodeproj in Xcode, build, and verify."
