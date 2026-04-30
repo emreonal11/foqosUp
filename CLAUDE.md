@@ -235,7 +235,9 @@ FoqosMac.xcodeproj/
     └── FoqosMacFilter.entitlements
 ```
 
-**Current reality (post-Phase B)**: `BridgeState` + `ICloudObserver` + `BridgeKey` are all inlined in `FoqosMacApp.swift` to avoid the project.pbxproj edit needed for new files. Splitting them into separate files is a Phase C cleanup task — also clears the SourceKit "main attribute / top-level code" lint warning.
+**Current reality (post-Phase B)**: `BridgeState` + `ICloudObserver` + `BridgeKey` are all inlined in `FoqosMacApp.swift`. The Phase B build was done before we realized the project uses synchronized file groups — see next note. Splitting them is a Phase C cleanup that also clears the SourceKit "main attribute / top-level code" lint warning.
+
+**Synchronized file groups (`PBXFileSystemSynchronizedRootGroup`)**: `FoqosMac.xcodeproj` was created with Xcode 26.x and uses `objectVersion = 77`, which gives each target a synchronized root group. Any Swift file dropped into the target's source directory (e.g. `FoqosMac/FoqosMac/`) is auto-included in the build — **no `project.pbxproj` edit required**. This applies to the container target today and (when Xcode keeps the same default for new targets) will apply to `FoqosMacFilter` once it's added. Adding a new *target* still requires Xcode's GUI; adding new *files* inside an existing target does not. This contrasts with the iOS Foqos project (§5), which uses the traditional file-reference pattern — that's why the iOS bridge was inlined into `Shared.swift`.
 
 ### Container app entitlements
 
@@ -502,7 +504,7 @@ Observed behavior worth noting:
 - iCloud sync latency under typical conditions: ~1–2 seconds. CLAUDE.md §8 says "10–20s typical, sometimes minutes" — that's the worst-case. In practice it's near-realtime.
 
 Known cosmetic issue (non-blocking, not a real compile error):
-- `FoqosMacApp.swift` triggers a SourceKit lint warning "main attribute cannot be used in a module that contains top-level code" because `@main struct FoqosMacApp` shares the file with `BridgeState`, `ICloudObserver`, and `BridgeKey`. Compiler accepts it; the IDE indexer is just grumpy. Cleanup task for Phase C: split `BridgeState`/`ICloudObserver` into a separate file (requires adding to the Xcode target via `project.pbxproj`).
+- `FoqosMacApp.swift` triggers a SourceKit lint warning "main attribute cannot be used in a module that contains top-level code" because `@main struct FoqosMacApp` shares the file with `BridgeState`, `ICloudObserver`, and `BridgeKey`. Compiler accepts it; the IDE indexer is just grumpy. Cleanup task for Phase C: split into separate files. Because the project uses synchronized file groups (see §6), this is just a file-system operation — no `project.pbxproj` edit needed.
 
 **Pending (Phase C — System Extension that actually blocks)**:
 
@@ -572,7 +574,7 @@ Sub-milestones (commit each separately):
 - **`NSUbiquitousKeyValueStore.didChangeExternallyNotification` reason codes seen**: `0` = `NSUbiquitousKeyValueStoreServerChange` (remote write — what we want), `1` = `NSUbiquitousKeyValueStoreInitialSyncChange` (fires once at app launch). Both should trigger a refresh.
 - **The KV identifier override** is the single most important Phase B detail. Xcode's default `$(TeamIdentifierPrefix)$(CFBundleIdentifier)` creates a *per-bundle* namespace; iOS and Mac end up unable to see each other. Override to `$(TeamIdentifierPrefix)com.usetessera.mybrick` on both sides. The `apply-mybrick-overrides.sh` script handles this for iOS; Mac has it set manually in `FoqosMac/FoqosMac/FoqosMac.entitlements`.
 - **Swift 6 strict concurrency on macOS Tahoe**: `@MainActor final class Foo: ObservableObject` with `@Published` properties requires explicit `import Combine` even though SwiftUI re-exports it. Without the import, you get "Initializer 'init(wrappedValue:)' is not available due to missing import of defining module 'Combine'" — for every `@Published`.
-- **SourceKit "main attribute cannot be used in a module that contains top-level code"**: this triggers when `@main struct App` shares a file with other top-level declarations (classes, structs, enums). It's a lint warning, not a compile error — the build succeeds. Fix is cosmetic: split into multiple files, but that requires editing `project.pbxproj` to add the new file to the target.
+- **SourceKit "main attribute cannot be used in a module that contains top-level code"**: this triggers when `@main struct App` shares a file with other top-level declarations (classes, structs, enums). It's a lint warning, not a compile error — the build succeeds. Fix is cosmetic: split into multiple files. With `PBXFileSystemSynchronizedRootGroup` (Xcode 26.x default, see §6), this is purely a file-system move — no `project.pbxproj` edit required.
 - **PLA acceptance**: Apple periodically updates the Program License Agreement. When pending, ALL Xcode signing operations fail with "Unable to process request - PLA Update available". Fix at developer.apple.com. May need to fully quit + relaunch Xcode for the cached state to clear. This will likely surface again when Phase C creates a new App ID for the FoqosMacFilter extension.
 - **SwiftData `[String]?` materialization quirk in upstream Foqos**: occasionally surfaces as `CoreData: Could not materialize Objective-C class named "Array"` warning. Doesn't always cause functional issues but is associated with the first-add-domain race we observed (where adding `instagram.com` initially produced an empty `domains` list). If Mac blocking shows stale or empty domains in production, this is the upstream bug to investigate.
 
@@ -583,9 +585,9 @@ Sub-milestones (commit each separately):
 The Claude environment has filesystem write restrictions:
 - **Reads** allowed anywhere
 - **Writes** allowed only to `.` (cwd) and `$TMPDIR` (`/tmp/claude-501`)
-- The cwd `/Users/emreonal/projects/mybrick` was deleted after migration; **writes to `~/projects/FoqosUp/` are blocked**
+- Cwd is now `/Users/emreonal/projects/FoqosUp` itself (since the foqosUp → FoqosUp migration), so **direct writes anywhere under the repo are allowed**.
 
-**Workaround**: Claude writes new file contents to `/tmp/claude-501/...` and provides a copy script the user runs. Examples of this pattern: the migration script, the apply-overrides update.
+**Workflow**: Claude edits files in place via the `Edit`/`Write` tools and the user reviews diffs before commit. The earlier "stage to `/tmp/claude-501/...` + bash install.sh" pattern (used during the foqosUp → FoqosUp migration when cwd was a deleted directory) is no longer needed for any work inside `~/projects/FoqosUp/`. Xcode GUI operations (target creation, capability adds in the Signing & Capabilities tab, provisioning regeneration) still require the user — Claude can't drive Xcode.
 
 ---
 
