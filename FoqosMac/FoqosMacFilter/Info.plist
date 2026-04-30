@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
 	<key>NSSystemExtensionUsageDescription</key>
-	<string>SYSTEM_EXTENSION_USAGE_DESCRIPTION</string>
+	<string>FoqosMac uses this network filter to block distracting websites when you've started a focus session on your iPhone.</string>
 	<key>NetworkExtension</key>
 	<dict>
 		<key>NEMachServiceName</key>
-		<string>$(TeamIdentifierPrefix)com.example.app-group.MySystemExtension</string>
+		<string>$(TeamIdentifierPrefix)com.usetessera.mybrick.FoqosMac.FoqosMacFilter</string>
 		<key>NEProviderClasses</key>
 		<dict>
 			<key>com.apple.networkextension.filter-data</key>
