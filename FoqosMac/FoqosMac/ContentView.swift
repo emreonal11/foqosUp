@@ -14,6 +14,10 @@ struct ContentView: View {
         }
       }
 
+      Text(state.filterStatus.summary)
+        .font(.caption)
+        .foregroundStyle(filterStatusColor)
+
       Divider()
 
       Group {
@@ -57,6 +61,15 @@ struct ContentView: View {
 
   private func prefix12(_ s: String) -> String {
     s.count > 12 ? String(s.prefix(12)) + "…" : s
+  }
+
+  private var filterStatusColor: Color {
+    switch state.filterStatus {
+    case .activeAndConfigured: return .secondary
+    case .error: return .red
+    case .needsApproval, .willActivateAfterReboot: return .orange
+    case .installing, .unknown: return .secondary
+    }
   }
 
   private static let timeFmt: DateFormatter = {

@@ -9,8 +9,10 @@ final class BridgeState: ObservableObject {
   @Published var activeProfileId: String?
   @Published var domains: [String] = []
   @Published var lastUpdated: Date?
+  @Published var filterStatus: FilterStatus = .unknown
 
   private let observer = ICloudObserver()
+  private lazy var activator = ExtensionActivator(state: self)
 
   init() {
     observer.onChange = { [weak self] in
@@ -18,6 +20,7 @@ final class BridgeState: ObservableObject {
     }
     refresh()
     observer.start()
+    activator.activateIfNeeded()
   }
 
   var menuBarSymbol: String {
