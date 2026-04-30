@@ -46,10 +46,8 @@ class FilterDataProvider: NEFilterDataProvider {
       return .allow()
     }
 
-    if hostname == "example.com" || hostname.hasSuffix(".example.com") {
-      log.info("DROP \(hostname, privacy: .public)")
-      return .drop()
-    }
-    return .allow()
+    let drop = hostname == "example.com" || hostname.hasSuffix(".example.com")
+    log.info("flow \(drop ? "DROP" : "allow", privacy: .public) \(hostname, privacy: .public)")
+    return drop ? .drop() : .allow()
   }
 }

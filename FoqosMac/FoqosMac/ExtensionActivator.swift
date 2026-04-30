@@ -34,23 +34,10 @@ final class ExtensionActivator: NSObject, @unchecked Sendable {
     super.init()
   }
 
+  @MainActor
   func activateIfNeeded() {
-    log.info("Checking filter state")
-    NEFilterManager.shared().loadFromPreferences { [weak self] error in
-      Task { @MainActor in
-        guard let self else { return }
-        if let error {
-          self.update(.error("load: \(error.localizedDescription)"))
-          return
-        }
-        if NEFilterManager.shared().isEnabled {
-          self.log.info("Filter already enabled, skipping activation")
-          self.update(.activeAndConfigured)
-        } else {
-          self.requestActivation()
-        }
-      }
-    }
+    log.info("activateIfNeeded — always submits activation request to refresh state")
+    requestActivation()
   }
 
   @MainActor
@@ -78,6 +65,7 @@ final class ExtensionActivator: NSObject, @unchecked Sendable {
         let cfg = NEFilterProviderConfiguration()
         cfg.filterPackets = false
         cfg.filterSockets = true
+        cfg.filterDataProviderBundleIdentifier = Self.extensionBundleId
         NEFilterManager.shared().providerConfiguration = cfg
         NEFilterManager.shared().localizedDescription = "FoqosMac"
         NEFilterManager.shared().isEnabled = true
