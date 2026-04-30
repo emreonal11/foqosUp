@@ -42,11 +42,24 @@ final class FilterDataProvider: NEFilterDataProvider {
 
   override func handleNewFlow(_ flow: NEFilterFlow) -> NEFilterNewFlowVerdict {
     guard let socketFlow = flow as? NEFilterSocketFlow,
-      let endpoint = socketFlow.remoteFlowEndpoint,
-      case .hostPort(let host, _) = endpoint
+      let endpoint = socketFlow.remoteFlowEndpoint
     else {
       return .allow()
     }
+
+    // QUIC blackhole: drop all UDP/443. HTTP/3 carries its TLS handshake in
+    // encrypted CRYPTO frames, so SNI inspection from outbound data doesn't
+    // work the way it does for TCP+TLS. Rather than parse QUIC (complex, key
+    // derivation involved), we drop UDP/443 wholesale and let browsers fall
+    // back to TCP+TLS — which they do automatically and quickly. Net effect:
+    // every HTTPS connection we care about goes through SNI inspection.
+    let isUDP = socketFlow.socketProtocol == Int32(IPPROTO_UDP)
+    if isUDP, case .hostPort(_, let port) = endpoint, port.rawValue == 443 {
+      log.info("flow DROP udp/443 (QUIC blackhole → TCP fallback)")
+      return .drop()
+    }
+
+    guard case .hostPort(let host, _) = endpoint else { return .allow() }
 
     switch host {
     case .name(let name, _):
@@ -58,7 +71,7 @@ final class FilterDataProvider: NEFilterDataProvider {
       return drop ? .drop() : .allow()
 
     case .ipv4, .ipv6:
-      // IP-only flow → peek outbound for ClientHello SNI.
+      // IP-only TCP flow → peek outbound for ClientHello SNI.
       return .filterDataVerdict(
         withFilterInbound: false,
         peekInboundBytes: 0,
@@ -77,12 +90,19 @@ final class FilterDataProvider: NEFilterDataProvider {
     readBytes: Data
   ) -> NEFilterDataVerdict {
     guard let sni = SNIParser.extractSNI(from: readBytes) else {
-      // Not parseable as a ClientHello with SNI. Most likely: not TLS, or
-      // the ClientHello hadn't fully arrived. We'd ideally request more bytes
-      // for the latter case, but distinguishing the two from the parser's nil
-      // is non-trivial — most non-TLS flows we'd peek aren't HTTP either, so
-      // allowing is the right trade-off for a personal-use blocker.
-      log.info("SNI nil — allowing")
+      // Not parseable as a ClientHello with SNI. Could be: non-TLS protocol,
+      // truncated ClientHello (unlikely, peek is 4KB), TLS resumption with
+      // session ticket but no SNI, or ECH-encrypted (~zero deployment 2026).
+      // Log enough context to spot patterns later.
+      let proto = (flow as? NEFilterSocketFlow)?.socketProtocol ?? -1
+      let port: UInt16 = {
+        guard let s = flow as? NEFilterSocketFlow,
+          let ep = s.remoteFlowEndpoint,
+          case .hostPort(_, let p) = ep
+        else { return 0 }
+        return p.rawValue
+      }()
+      log.info("SNI nil [proto=\(proto, privacy: .public) port=\(port, privacy: .public) bytes=\(readBytes.count, privacy: .public)] — allowing")
       return .allow()
     }
     let drop = Self.matches(host: sni)
