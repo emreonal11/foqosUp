@@ -212,38 +212,48 @@ The bridge code is **inlined into `Shared.swift`** as a private helper, not a se
 
 ---
 
-## 6. macOS Mac app — planned architecture
+## 6. macOS Mac app — architecture
 
-### Targets
+### Targets (planned final layout)
 
 ```
 FoqosMac.xcodeproj/
 ├── FoqosMac/                  ← container app (SwiftUI MenuBarExtra)
-│   ├── FoqosMacApp.swift      ← @main, MenuBarExtra
-│   ├── ICloudObserver.swift   ← NSUbiquitousKeyValueStore listener
-│   ├── ExtensionActivator.swift  ← OSSystemExtensionRequest flow
-│   ├── EmergencyOverride.swift   ← PIN UI + Keychain storage
-│   ├── AppGroupBridge.swift   ← writes state to App Group, posts Darwin notification
-│   └── FoqosMac.entitlements
-└── FoqosMacFilter/            ← System Extension
+│   ├── FoqosMacApp.swift      ← @main, MenuBarExtra (DONE, Phase B)
+│   ├── ContentView.swift      ← state-display dropdown UI (DONE, Phase B)
+│   ├── BridgeState.swift      ← ObservableObject (TODO Phase C: split out of FoqosMacApp.swift)
+│   ├── ICloudObserver.swift   ← NSUbiquitousKeyValueStore listener (TODO Phase C: split out)
+│   ├── ExtensionActivator.swift  ← OSSystemExtensionRequest flow (TODO Phase C)
+│   ├── AppGroupBridge.swift   ← writes state to App Group, posts Darwin notification (TODO Phase C)
+│   ├── EmergencyOverride.swift   ← PIN UI + Keychain storage (TODO Phase E)
+│   └── FoqosMac.entitlements  ← KV + App Group (DONE Phase B); add NE + SE for Phase C
+└── FoqosMacFilter/            ← System Extension (TODO Phase C — entire target doesn't exist yet)
     ├── FilterDataProvider.swift   ← NEFilterDataProvider subclass
     ├── FilterControlProvider.swift ← NEFilterControlProvider stub
-    ├── SNIParser.swift            ← TLS ClientHello SNI extraction
+    ├── SNIParser.swift            ← TLS ClientHello SNI extraction (Phase D)
     ├── BlocklistMatcher.swift     ← exact + suffix matching
     └── FoqosMacFilter.entitlements
 ```
 
+**Current reality (post-Phase B)**: `BridgeState` + `ICloudObserver` + `BridgeKey` are all inlined in `FoqosMacApp.swift` to avoid the project.pbxproj edit needed for new files. Splitting them into separate files is a Phase C cleanup task — also clears the SourceKit "main attribute / top-level code" lint warning.
+
 ### Container app entitlements
 
-- `com.apple.developer.ubiquity-kvstore-identifier` = `$(TeamIdentifierPrefix)com.usetessera.mybrick` (same as iOS)
+Phase B (done):
+- `com.apple.developer.ubiquity-kvstore-identifier` = `$(TeamIdentifierPrefix)com.usetessera.mybrick` (same as iOS — **must NOT default to `$(CFBundleIdentifier)`**, that creates a per-bundle namespace which iOS can't reach)
+- `com.apple.security.app-sandbox` = `true`
+- `com.apple.security.application-groups` = `[group.com.usetessera.mybrick]`
+
+Phase C (to add):
+- `com.apple.developer.networking.networkextension` = `[content-filter-provider-systemextension]`
+- `com.apple.developer.system-extension.install` = `true`
+
+### Extension entitlements (Phase C)
+
 - `com.apple.security.application-groups` = `[group.com.usetessera.mybrick]`
 - `com.apple.developer.networking.networkextension` = `[content-filter-provider-systemextension]`
-- `com.apple.developer.system-extension.install` = true
 
-### Extension entitlements
-
-- `com.apple.security.application-groups` = `[group.com.usetessera.mybrick]`
-- `com.apple.developer.networking.networkextension` = `[content-filter-provider-systemextension]`
+⚠️ **Critical**: when adding the iCloud capability via Xcode's `+ Capability` dialog, the search for "iCloud" returns BOTH `iCloud` and `iCloud Extended Share Access`. Only the first is wanted. The second is a separate macOS Tahoe capability for in-process app sharing — adds noise + can interfere with provisioning. If accidentally added, click the trash icon on its capability row to remove.
 
 ### NEFilterDataProvider behavior on macOS
 
@@ -494,21 +504,77 @@ Observed behavior worth noting:
 Known cosmetic issue (non-blocking, not a real compile error):
 - `FoqosMacApp.swift` triggers a SourceKit lint warning "main attribute cannot be used in a module that contains top-level code" because `@main struct FoqosMacApp` shares the file with `BridgeState`, `ICloudObserver`, and `BridgeKey`. Compiler accepts it; the IDE indexer is just grumpy. Cleanup task for Phase C: split `BridgeState`/`ICloudObserver` into a separate file (requires adding to the Xcode target via `project.pbxproj`).
 
-**Pending (Phase C — System Extension)**:
-1. NEFilterDataProvider + NEFilterControlProvider stub
-2. Extension activation via OSSystemExtensionRequest
-3. First test: hardcoded block, verify in Chrome
+**Pending (Phase C — System Extension that actually blocks)**:
 
-**Pending (Phase D — Filter logic)**:
-1. Hostname matching for Safari/Firefox path
-2. SNI inspection for Chrome path (TLS ClientHello parser)
-3. Real-world testing against blocklist domains
+Goal: Mac drops TCP connections to blocklisted hosts when iOS state says blocked. End-to-end: NFC scan on iPhone → iCloud → FoqosMac container → App Group + Darwin notification → FoqosMacFilter extension → `NEFilterDataProvider.handleNewFlow` returns `.drop()` for matching flows.
+
+Sub-milestones (commit each separately):
+
+1. **Add `FoqosMacFilter` System Extension target to `FoqosMac.xcodeproj`**
+   - Xcode: File → New → Target → macOS → Network Extension
+   - Provider type: Content Filter Provider
+   - Bundle ID: `com.usetessera.mybrick.FoqosMac.FoqosMacFilter` (must be a sub-identifier of the container — Apple requires this for sysextensions)
+   - Add `App Groups` capability with `group.com.usetessera.mybrick`
+   - Configure entitlements per §6 "Extension entitlements"
+   - Container target gets `com.apple.developer.networking.networkextension` and `com.apple.developer.system-extension.install` added (per §6 "Container app entitlements" Phase C section)
+
+2. **Apple Developer portal capability check**
+   - Xcode automatic signing should auto-register the new App ID and add Network Extensions capability for personal team use
+   - If "Network Extensions capability not found" red error persists past 60s, may need to email networkextension@apple.com requesting the capability (NOT usually required for solo dev personal apps; try Xcode auto first)
+   - PLA acceptance gotcha may resurface for the new App ID — same fix as Phase A: developer.apple.com → accept agreement → quit and reopen Xcode
+
+3. **Container: ExtensionActivator (Swift, in container app target)**
+   - Use `OSSystemExtensionRequest.activationRequest(forExtensionWithIdentifier:queue:)` with the filter's bundle ID
+   - Handle delegate callbacks: `request(_:actionForReplacingExtension:with:)` returns `.replace`; `request(_:didFinishWithResult:)` checks `.completed` vs `.willCompleteAfterReboot`; `request(_:didFailWithError:)` for retries
+   - Surface state to BridgeState so the menu bar UI can show "Filter active / inactive / needs approval"
+   - Add a button in `ContentView.swift` to trigger activation on first launch
+
+4. **Extension: hardcoded-block first milestone**
+   - `FilterDataProvider.swift` subclass of `NEFilterDataProvider`
+   - In `startFilter`: install a `NEFilterRule` matching all flows (or `NEFilterSettings(rules: [], defaultAction: .filterData)`) so all new flows are routed through `handleNewFlow`
+   - In `handleNewFlow`: if the flow's hostname == hardcoded `"example.com"`, return `.drop()`. Else `.allow()`
+   - **Verification command**: in Terminal: `curl -v --max-time 5 https://example.com` — should fail with "Couldn't connect to server" or similar TCP-level error. `curl https://google.com` should still succeed.
+   - This proves the system extension plumbing works without depending on iCloud/AppGroup/Darwin notification yet.
+
+5. **Container ↔ Extension IPC (App Group + Darwin notification)**
+   - `AppGroupBridge.swift` in container app: subscribes to `BridgeState`'s `objectWillChange`, when state changes writes the relevant fields (`isBlocked`, `isBreakActive`, `isPauseActive`, `domains`) to `UserDefaults(suiteName: "group.com.usetessera.mybrick")`
+   - After the write: `CFNotificationCenterPostNotification` with name `"com.usetessera.mybrick.state.changed"` (Darwin notification, system-wide)
+   - In the extension: `CFNotificationCenterAddObserver` with the same notification name, callback re-reads UserDefaults and updates an in-memory blocklist
+   - Replace the hardcoded `"example.com"` check with a lookup against the in-memory list
+
+6. **Verify end-to-end**
+   - With iPhone unblocked: `curl https://instagram.com` succeeds
+   - Brick on iPhone (with `instagram.com` in domains list)
+   - Wait ~2-3s (iCloud + container update + Darwin notification)
+   - `curl https://instagram.com` should now fail
+   - Unbrick → curl works again
+
+**Phase C does NOT include**: Chrome SNI inspection (Phase D — Chrome's IP-only flows need TLS ClientHello parsing); user-facing UI for managing the filter beyond a basic toggle; emergency override (Phase E). Phase C is about proving the kill-switch plumbing works for the simple Safari/curl/NSURLSession case.
+
+**Pending (Phase D — Chrome SNI inspection)**:
+1. Detect IP-only flows (when `flow.remoteEndpoint.hostname` is an IP address, see §3 "Chrome problem")
+2. Return `.filterDataVerdict(peekOutboundBytes: 1024)` for those flows
+3. Implement `handleOutboundData(from:readBytesStartOffset:readBytes:)` to parse TLS ClientHello and extract SNI
+4. SNI parser: ~50 LOC of Swift, RFC 8446 §4.1.2 + RFC 6066 §3 — see §14 for reference
+5. Real-world test: open Instagram in Chrome with phone bricked → should hit "can't connect"
 
 **Pending (Phase E — Polish)**:
-1. SMAppService login-at-startup
-2. Menu bar status icon
-3. Emergency override (Keychain PIN)
-4. Notarize for personal use
+1. SMAppService login-at-startup (`SMAppService.mainApp.register()`)
+2. Custom menu bar icon (currently uses SF Symbol `lock.fill` / `lock.open`)
+3. `LSUIElement = true` in Info.plist to hide Dock icon (currently shows in both Dock + menu bar)
+4. Emergency override (4-digit PIN in Keychain, local-only, doesn't write to iCloud — see §6)
+5. Notarize for personal use (avoids Gatekeeper warnings on rebuild)
+6. Custom AppIcon (currently default Xcode template)
+
+### Cross-cutting learnings from Phase A & B (preserve for future sessions)
+
+- **iCloud KV sync latency in practice**: ~1–2 seconds for KV updates between iPhone and Mac on the same Apple ID. CLAUDE.md §8's "10–20s typical" is the worst-case docs figure; real-world is much faster. Don't over-engineer for slow sync.
+- **`NSUbiquitousKeyValueStore.didChangeExternallyNotification` reason codes seen**: `0` = `NSUbiquitousKeyValueStoreServerChange` (remote write — what we want), `1` = `NSUbiquitousKeyValueStoreInitialSyncChange` (fires once at app launch). Both should trigger a refresh.
+- **The KV identifier override** is the single most important Phase B detail. Xcode's default `$(TeamIdentifierPrefix)$(CFBundleIdentifier)` creates a *per-bundle* namespace; iOS and Mac end up unable to see each other. Override to `$(TeamIdentifierPrefix)com.usetessera.mybrick` on both sides. The `apply-mybrick-overrides.sh` script handles this for iOS; Mac has it set manually in `FoqosMac/FoqosMac/FoqosMac.entitlements`.
+- **Swift 6 strict concurrency on macOS Tahoe**: `@MainActor final class Foo: ObservableObject` with `@Published` properties requires explicit `import Combine` even though SwiftUI re-exports it. Without the import, you get "Initializer 'init(wrappedValue:)' is not available due to missing import of defining module 'Combine'" — for every `@Published`.
+- **SourceKit "main attribute cannot be used in a module that contains top-level code"**: this triggers when `@main struct App` shares a file with other top-level declarations (classes, structs, enums). It's a lint warning, not a compile error — the build succeeds. Fix is cosmetic: split into multiple files, but that requires editing `project.pbxproj` to add the new file to the target.
+- **PLA acceptance**: Apple periodically updates the Program License Agreement. When pending, ALL Xcode signing operations fail with "Unable to process request - PLA Update available". Fix at developer.apple.com. May need to fully quit + relaunch Xcode for the cached state to clear. This will likely surface again when Phase C creates a new App ID for the FoqosMacFilter extension.
+- **SwiftData `[String]?` materialization quirk in upstream Foqos**: occasionally surfaces as `CoreData: Could not materialize Objective-C class named "Array"` warning. Doesn't always cause functional issues but is associated with the first-add-domain race we observed (where adding `instagram.com` initially produced an empty `domains` list). If Mac blocking shows stale or empty domains in production, this is the upstream bug to investigate.
 
 ---
 
@@ -563,15 +629,16 @@ open FoqosMac.xcodeproj
 
 ### Verifying the iCloud bridge
 
-After Phase A:
-1. Build iOS to phone
-2. Open Console.app on Mac (user's Mac, signed into same iCloud)
-3. Filter: `subsystem == "com.usetessera.mybrick"`
-4. On phone: scan NFC to start a session
-5. Console should show `[ICloudStateBridge] sessionStarted` within ~20s of the brick
-6. Verify keys via terminal: `defaults read com.apple.iCloud.UbiquitousKeyValueStore` (or use the Mac container app once it exists)
+**Easiest path: use FoqosMac itself** (Phase B onwards). Run FoqosMac from Xcode (`⌘R`). The menu bar dropdown shows live state. Brick on iPhone → menu bar lock icon flips within ~1–2s.
+
+**Alternate: Xcode debug console** (more diagnostic detail). With the Foqos iOS app or FoqosMac app running from Xcode and the debugger attached:
+- Filter the Xcode debug area on `iCloudBridge` (iOS) or `ICloudObserver` (Mac)
+- iOS side: NFC scan → `sessionStarted profile=… domains=…`
+- Mac side: NFC scan → `External change reason=0 keys=[mybrick.isBlocked, …]`
+
+⚠️ **Console.app is NOT a reliable verification path.** Console.app on macOS Tahoe filters out `os_log` Info messages from physical iPhones inconsistently even with "Include Info Messages" enabled. The iOS debugging story always works through Xcode's debug area when the debugger is attached. Once Xcode says "Finished running", the debug console stops capturing — must re-`⌘R`.
 
 ---
 
 **Last fork sync**: Foqos 1.32.4 (commit `5ac998f`, 2026)
-**Document version**: 2026-04-29 — Phase A in progress
+**Document version**: 2026-04-30 — Phase A and Phase B complete; Phase C (System Extension) is next.
