@@ -471,18 +471,28 @@ git add -A && git commit -m "Bootstrap"
 - ✅ Pause semantics fully understood
 - ✅ Chrome SNI inspection plan finalized
 
-**In progress (Phase A — iOS bridge)**:
-1. Add `com.apple.developer.ubiquity-kvstore-identifier` entitlement to all 4 iOS targets (4 entitlements files)
-2. Modify `Foqos/Foqos/Models/Shared.swift` — inline `ICloudStateBridge` helper + add hooks in 9 setters (`createActiveSharedSession`, `createSessionForSchedular`, `flushActiveSession`, `endActiveSharedSession`, `setBreakStartTime`, `setBreakEndTime`, `setPauseStartTime`, `setPauseEndTime`, `setSnapshot`)
-3. Update `scripts/apply-mybrick-overrides.sh` — inject iCloud entitlement on re-vendor (idempotent via PlistBuddy)
-4. User: Xcode → for each of 4 targets → Signing & Capabilities → "+ Capability" → iCloud → check Key-value storage. This forces App ID + provisioning profile regeneration.
-5. User: build to phone, open Console.app, filter `subsystem:com.usetessera.mybrick`, brick/unbrick → verify writes appear
+**Done (Phase A — iOS bridge)**:
+- ✅ Added `com.apple.developer.ubiquity-kvstore-identifier` entitlement to all 4 iOS targets
+- ✅ Inlined `ICloudStateBridge` helper into `Foqos/Foqos/Models/Shared.swift` with hooks in 9 setters: `createActiveSharedSession`, `createSessionForSchedular`, `flushActiveSession`, `endActiveSharedSession`, `setBreakStartTime`, `setBreakEndTime`, `setPauseStartTime`, `setPauseEndTime`, `setSnapshot` (see §5 for full table + rationale)
+- ✅ Updated `scripts/apply-mybrick-overrides.sh` with idempotent PlistBuddy block to inject the entitlement on re-vendor
+- ✅ Xcode capability + provisioning profile regeneration completed for all 4 targets
+- ✅ Verified on device: NFC scan triggers `sessionStarted profile=… domains=…` log under subsystem `com.usetessera.mybrick`, category `iCloudBridge`. Commit `d73ae06`.
 
-**Pending (Phase B — Mac scaffold)**:
-1. User creates Xcode project in `FoqosUp/FoqosMac/` (macOS App template, SwiftUI lifecycle, two targets)
-2. Configure entitlements + App Group + iCloud + NetworkExtension capability
-3. Container app: SwiftUI MenuBarExtra, iCloud KV observer, App Group bridge
-4. First milestone: Mac sees iCloud values change when iPhone bricks/unbricks
+**Done (Phase B — Mac container app reading iCloud)**:
+- ✅ Xcode project at `FoqosUp/FoqosMac/FoqosMac.xcodeproj` (macOS App template, SwiftUI, App Sandbox + Hardened Runtime on)
+- ✅ Bundle ID `com.usetessera.mybrick.FoqosMac`, team `5K5YSF2TWZ`, deployment target macOS 26.3
+- ✅ Capabilities: iCloud (Key-value storage) + App Groups (`group.com.usetessera.mybrick`)
+- ✅ Critical fix: KV identifier in `FoqosMac.entitlements` overridden from Xcode default `$(TeamIdentifierPrefix)$(CFBundleIdentifier)` → `$(TeamIdentifierPrefix)com.usetessera.mybrick` to match iOS namespace exactly
+- ✅ App skeleton: `FoqosMacApp.swift` (@main + `BridgeState` ObservableObject + `ICloudObserver`), `ContentView.swift` (state-display UI)
+- ✅ MenuBarExtra UI: lock icon (filled when blocked, open when not) + dropdown panel showing all 6 bridge keys + Force-sync/Quit buttons
+- ✅ Verified end-to-end: bricking iPhone flips Mac menu bar icon + populates panel within **1–2s** (much faster than the 10–20s estimate; iCloud is performant when not under load). Domains list shows `instagram.com`. Profile UUID matches iOS.
+
+Observed behavior worth noting:
+- iCloud KV `didChangeExternallyNotification` reason `0` (= `NSUbiquitousKeyValueStoreServerChange`, remote write) fires reliably on every brick/unbrick.
+- iCloud sync latency under typical conditions: ~1–2 seconds. CLAUDE.md §8 says "10–20s typical, sometimes minutes" — that's the worst-case. In practice it's near-realtime.
+
+Known cosmetic issue (non-blocking, not a real compile error):
+- `FoqosMacApp.swift` triggers a SourceKit lint warning "main attribute cannot be used in a module that contains top-level code" because `@main struct FoqosMacApp` shares the file with `BridgeState`, `ICloudObserver`, and `BridgeKey`. Compiler accepts it; the IDE indexer is just grumpy. Cleanup task for Phase C: split `BridgeState`/`ICloudObserver` into a separate file (requires adding to the Xcode target via `project.pbxproj`).
 
 **Pending (Phase C — System Extension)**:
 1. NEFilterDataProvider + NEFilterControlProvider stub
