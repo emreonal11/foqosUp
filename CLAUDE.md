@@ -190,15 +190,21 @@ All in `Shared.swift` setters. Hooking here covers both the main app and the Foq
 
 | Setter | Triggers |
 |---|---|
-| `createActiveSharedSession(_:)` | session start → write `isBlocked=true`, profileId, domains, reset break/pause flags |
-| `flushActiveSession()` | session end → write `isBlocked=false`, clear profileId/domains, reset break/pause |
+| `createActiveSharedSession(_:)` | session start (NFC/QR/manual strategies, via `BlockedProfileSessions.createSession`) → write `isBlocked=true`, profileId, domains, reset break/pause flags |
+| `createSessionForSchedular(for:)` | session start (DeviceActivity-driven scheduled blocks, via `ScheduleTimerActivity.start`) → same payload as `createActiveSharedSession` |
+| `flushActiveSession()` | session end (NFC/QR/manual strategies, via `BlockedProfileSessions.endSession`) → write `isBlocked=false`, clear profileId/domains, reset break/pause |
+| `endActiveSharedSession()` | session end (DeviceActivity-driven schedule end + strategy timer expiry, via `ScheduleTimerActivity.stop`/`StrategyTimerActivity.stop`) → same payload as `flushActiveSession` |
 | `setBreakStartTime(date:)` | break start → write `isBreakActive=true` |
 | `setBreakEndTime(date:)` | break end → write `isBreakActive=false` |
 | `setPauseStartTime(date:)` | pause start → write `isPauseActive=true` |
 | `setPauseEndTime(date:)` | pause end → write `isPauseActive=false` |
 | `setSnapshot(_:for:)` | profile updated → if profile == active session's profile, write updated `domains` |
 
+Why 9 hooks, not 7: there are two parallel session-lifecycle paths in the codebase. `BlockedProfileSessions.createSession`/`endSession` (driven by NFC, QR, and manual strategies) call `createActiveSharedSession`/`flushActiveSession`. The DeviceActivity-driven paths (scheduled blocks, strategy timer expiry) instead call `createSessionForSchedular`/`endActiveSharedSession` from inside the FoqosDeviceMonitor extension. Hooking only the first pair leaves Mac state stuck whenever a session begins or ends via a timer. The break/pause setters are shared by both contexts.
+
 Domain updates during an active session need the `setSnapshot` hook because users can edit their blocklist mid-session. The `setSnapshot` hook checks `if let activeSession, activeSession.blockedProfileId.uuidString == profileID { ... }`.
+
+Setters intentionally NOT hooked: `setEndTime(date:)` only writes the `endTime` field on the SessionSnapshot for the completed-sessions archive — it's called immediately before `flushActiveSession` and the iCloud cleanup happens there. `resetPause()` clears `pauseStartTime`/`pauseEndTime` on the snapshot before `setPauseStartTime` writes the new values; the pause-start hook handles iCloud state. `removeSnapshot(for:)` is profile deletion via UI — not a session lifecycle event.
 
 ### Implementation choice: inline, no new file
 
@@ -467,8 +473,8 @@ git add -A && git commit -m "Bootstrap"
 
 **In progress (Phase A — iOS bridge)**:
 1. Add `com.apple.developer.ubiquity-kvstore-identifier` entitlement to all 4 iOS targets (4 entitlements files)
-2. Modify `Foqos/Foqos/Models/Shared.swift` — inline `ICloudStateBridge` helper + add hooks in 7 setters (`createActiveSharedSession`, `flushActiveSession`, `setBreakStartTime`, `setBreakEndTime`, `setPauseStartTime`, `setPauseEndTime`, `setSnapshot`)
-3. Update `scripts/apply-mybrick-overrides.sh` — inject iCloud entitlement on re-vendor
+2. Modify `Foqos/Foqos/Models/Shared.swift` — inline `ICloudStateBridge` helper + add hooks in 9 setters (`createActiveSharedSession`, `createSessionForSchedular`, `flushActiveSession`, `endActiveSharedSession`, `setBreakStartTime`, `setBreakEndTime`, `setPauseStartTime`, `setPauseEndTime`, `setSnapshot`)
+3. Update `scripts/apply-mybrick-overrides.sh` — inject iCloud entitlement on re-vendor (idempotent via PlistBuddy)
 4. User: Xcode → for each of 4 targets → Signing & Capabilities → "+ Capability" → iCloud → check Key-value storage. This forces App ID + provisioning profile regeneration.
 5. User: build to phone, open Console.app, filter `subsystem:com.usetessera.mybrick`, brick/unbrick → verify writes appear
 

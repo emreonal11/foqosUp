@@ -1,5 +1,6 @@
 import FamilyControls
 import Foundation
+import OSLog
 
 enum SharedData {
   private static let suite = UserDefaults(
@@ -92,6 +93,12 @@ enum SharedData {
     var all = profileSnapshots
     all[profileID] = snapshot
     profileSnapshots = all
+
+    if let active = activeSharedSession,
+      active.blockedProfileId.uuidString == profileID
+    {
+      ICloudStateBridge.setDomains(snapshot.domains ?? [])
+    }
   }
 
   static func removeSnapshot(for profileID: String) {
@@ -137,10 +144,16 @@ enum SharedData {
       blockedProfileId: profileID,
       startTime: Date(),
       forceStarted: true)
+
+    let domains = profileSnapshots[profileID.uuidString]?.domains ?? []
+    ICloudStateBridge.sessionStarted(profileId: profileID, domains: domains)
   }
 
   static func createActiveSharedSession(for session: SessionSnapshot) {
     activeSharedSession = session
+
+    let domains = profileSnapshots[session.blockedProfileId.uuidString]?.domains ?? []
+    ICloudStateBridge.sessionStarted(profileId: session.blockedProfileId, domains: domains)
   }
 
   static func getActiveSharedSession() -> SessionSnapshot? {
@@ -154,10 +167,12 @@ enum SharedData {
     completedSessionsInSchedular.append(existingScheduledSession)
 
     activeSharedSession = nil
+    ICloudStateBridge.sessionEnded()
   }
 
   static func flushActiveSession() {
     activeSharedSession = nil
+    ICloudStateBridge.sessionEnded()
   }
 
   static func getCompletedSessionsForSchedular() -> [SessionSnapshot] {
@@ -169,11 +184,15 @@ enum SharedData {
   }
 
   static func setBreakStartTime(date: Date) {
+    guard activeSharedSession != nil else { return }
     activeSharedSession?.breakStartTime = date
+    ICloudStateBridge.setBreakActive(true)
   }
 
   static func setBreakEndTime(date: Date) {
+    guard activeSharedSession != nil else { return }
     activeSharedSession?.breakEndTime = date
+    ICloudStateBridge.setBreakActive(false)
   }
 
   static func setEndTime(date: Date) {
@@ -186,10 +205,87 @@ enum SharedData {
   }
 
   static func setPauseStartTime(date: Date) {
+    guard activeSharedSession != nil else { return }
     activeSharedSession?.pauseStartTime = date
+    ICloudStateBridge.setPauseActive(true)
   }
 
   static func setPauseEndTime(date: Date) {
+    guard activeSharedSession != nil else { return }
     activeSharedSession?.pauseEndTime = date
+    ICloudStateBridge.setPauseActive(false)
+  }
+}
+
+// MARK: – iCloud State Bridge (Phase A)
+//
+// Mirrors session state to NSUbiquitousKeyValueStore so the macOS companion
+// (FoqosMac) can observe iOS blocking state. iOS writes; Mac reads.
+// Inlined here to avoid registering a new file with all 4 Xcode targets.
+private enum ICloudStateBridge {
+  private static let log = Logger(
+    subsystem: "com.usetessera.mybrick", category: "iCloudBridge")
+  private static let store = NSUbiquitousKeyValueStore.default
+
+  private enum Key {
+    static let isBlocked = "mybrick.isBlocked"
+    static let isBreakActive = "mybrick.isBreakActive"
+    static let isPauseActive = "mybrick.isPauseActive"
+    static let activeBlocklistDomains = "mybrick.activeBlocklistDomains"
+    static let activeProfileId = "mybrick.activeProfileId"
+    static let lastUpdated = "mybrick.lastUpdated"
+  }
+
+  static func sessionStarted(profileId: UUID, domains: [String]) {
+    store.set(true, forKey: Key.isBlocked)
+    store.set(false, forKey: Key.isBreakActive)
+    store.set(false, forKey: Key.isPauseActive)
+    store.set(profileId.uuidString, forKey: Key.activeProfileId)
+    writeDomains(domains)
+    touch()
+    log.info(
+      "sessionStarted profile=\(profileId.uuidString, privacy: .public) domains=\(domains.count, privacy: .public)"
+    )
+  }
+
+  static func sessionEnded() {
+    store.set(false, forKey: Key.isBlocked)
+    store.set(false, forKey: Key.isBreakActive)
+    store.set(false, forKey: Key.isPauseActive)
+    store.removeObject(forKey: Key.activeProfileId)
+    store.removeObject(forKey: Key.activeBlocklistDomains)
+    touch()
+    log.info("sessionEnded")
+  }
+
+  static func setBreakActive(_ active: Bool) {
+    store.set(active, forKey: Key.isBreakActive)
+    touch()
+    log.info("breakActive=\(active, privacy: .public)")
+  }
+
+  static func setPauseActive(_ active: Bool) {
+    store.set(active, forKey: Key.isPauseActive)
+    touch()
+    log.info("pauseActive=\(active, privacy: .public)")
+  }
+
+  static func setDomains(_ domains: [String]) {
+    writeDomains(domains)
+    touch()
+    log.info("domainsUpdated count=\(domains.count, privacy: .public)")
+  }
+
+  private static func writeDomains(_ domains: [String]) {
+    if let data = try? JSONEncoder().encode(domains) {
+      store.set(data, forKey: Key.activeBlocklistDomains)
+    } else {
+      store.removeObject(forKey: Key.activeBlocklistDomains)
+    }
+  }
+
+  private static func touch() {
+    store.set(Date().timeIntervalSince1970, forKey: Key.lastUpdated)
+    store.synchronize()
   }
 }
