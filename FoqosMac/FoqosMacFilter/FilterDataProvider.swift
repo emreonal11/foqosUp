@@ -13,6 +13,29 @@ import OSLog
 final class FilterDataProvider: NEFilterDataProvider {
   private let log = Logger(subsystem: "com.usetessera.mybrick", category: "FilterDataProvider")
   private static let peekBytes = 4096  // ample for ClientHello (typical < 700 bytes)
+  private static let watchChunk = 65536  // 64 KB inspection chunks for blocklist-matching flows
+
+  /// Every TLS flow we've extracted an SNI for. We keep them under
+  /// continuing outbound-data inspection (rather than returning `.allow()`
+  /// and detaching) so we can drop them the moment state transitions in a
+  /// way that should now block them. Apple's NEFilterDataProvider has no
+  /// retroactive kill API for already-allowed flows, so ongoing inspection
+  /// is the only way to handle break-end / pause-end / blocklist-mutation
+  /// without leaving stale connections alive in the browser. Idle flows
+  /// cost nothing — `handleOutboundData` only fires when bytes actually
+  /// move. Keyed by NEFilterFlow.identifier.
+  ///
+  /// Lifetime: an entry is added when a flow's SNI is first inspected and
+  /// removed when the flow is retroactively dropped. The kernel does not
+  /// notify us when an allowed flow ends naturally (browser closes the
+  /// connection), so entries for naturally-closed flows linger until process
+  /// exit. In practice the dict tracks "TLS flows seen since filter started",
+  /// which is on the order of thousands per day of heavy use and bounded
+  /// by available file descriptors anyway. The growth-milestone log below
+  /// surfaces it if anything ever goes pathological.
+  private let watchedLock = NSLock()
+  private var watchedSNI: [UUID: String] = [:]
+  private var nextGrowthMilestone = 1_000
 
   override func startFilter(completionHandler: @escaping (Error?) -> Void) {
     log.info("startFilter")
@@ -94,6 +117,23 @@ final class FilterDataProvider: NEFilterDataProvider {
     readBytesStartOffset offset: Int,
     readBytes: Data
   ) -> NEFilterDataVerdict {
+    let flowID = flow.identifier
+
+    // Subsequent chunk on an already-watched flow. Re-check whether the
+    // current BlocklistState says this SNI should now be blocked. This is
+    // where break-end / pause-end / blocklist-mutation cases get caught —
+    // the state may have changed since the previous chunk.
+    if let sni = cachedSNI(for: flowID) {
+      if BlocklistState.shared.shouldBlock(host: sni) {
+        forgetFlow(flowID)
+        log.info("SNI DROP \(sni, privacy: .public) [retroactive — state changed]")
+        return .drop()
+      }
+      // Still allowed. Pass these bytes through and peek the next chunk.
+      return NEFilterDataVerdict(passBytes: readBytes.count, peekBytes: Self.watchChunk)
+    }
+
+    // First-time inspection. Try to extract SNI from the ClientHello.
     guard let sni = SNIParser.extractSNI(from: readBytes) else {
       // Not parseable as a ClientHello with SNI. Could be: non-TLS protocol,
       // truncated ClientHello (unlikely, peek is 4KB), TLS resumption with
@@ -112,8 +152,62 @@ final class FilterDataProvider: NEFilterDataProvider {
       )
       return .allow()
     }
-    let drop = BlocklistState.shared.shouldBlock(host: sni)
-    log.info("SNI \(drop ? "DROP" : "allow", privacy: .public) \(sni, privacy: .public)")
-    return drop ? .drop() : .allow()
+
+    if BlocklistState.shared.shouldBlock(host: sni) {
+      log.info("SNI DROP \(sni, privacy: .public)")
+      return .drop()
+    }
+
+    // Allowed right now. Keep the flow under continuing data inspection so
+    // we can react to *any* future state change — break end, blocklist
+    // mutation (user adds the SNI's domain to the active profile after
+    // unbrick + rebrick), pause toggle, etc. Apple's NEFilterDataProvider
+    // has no retroactive kill API for `.allow()`d flows; ongoing inspection
+    // is the only mechanism that actually works. The cost is bounded by
+    // active flow throughput — per CLAUDE.md §16's perf notes, ~0.1% CPU
+    // on a 5 Mbps stream with peekBytes=64 KB. Idle flows are free.
+    rememberFlow(flowID, sni: sni)
+    log.info("SNI watch \(sni, privacy: .public)")
+    return NEFilterDataVerdict(passBytes: readBytes.count, peekBytes: Self.watchChunk)
+  }
+
+  // MARK: - Watched-flow tracking
+
+  private func cachedSNI(for id: UUID) -> String? {
+    watchedLock.lock()
+    let v = watchedSNI[id]
+    watchedLock.unlock()
+    return v
+  }
+
+  private func rememberFlow(_ id: UUID, sni: String) {
+    watchedLock.lock()
+    watchedSNI[id] = sni
+    let count = watchedSNI.count
+    var milestone = -1
+    if count >= nextGrowthMilestone {
+      milestone = nextGrowthMilestone
+      // Log at 1K, 5K, 10K, 50K, 100K — diagnostic only.
+      switch nextGrowthMilestone {
+      case 1_000: nextGrowthMilestone = 5_000
+      case 5_000: nextGrowthMilestone = 10_000
+      case 10_000: nextGrowthMilestone = 50_000
+      case 50_000: nextGrowthMilestone = 100_000
+      default: nextGrowthMilestone = .max
+      }
+    }
+    watchedLock.unlock()
+
+    if milestone > 0 {
+      log.info(
+        "watchedSNI crossed \(milestone, privacy: .public) entries (now \(count, privacy: .public)) — diagnostic only"
+      )
+    }
+  }
+
+  private func forgetFlow(_ id: UUID) {
+    watchedLock.lock()
+    watchedSNI.removeValue(forKey: id)
+    watchedLock.unlock()
   }
 }

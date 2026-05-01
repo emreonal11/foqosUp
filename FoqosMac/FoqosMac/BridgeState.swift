@@ -40,7 +40,7 @@ final class BridgeState: ObservableObject {
 
   var menuBarSymbol: String {
     if emergencyOverrideActive { return "lock.slash" }
-    if effectiveBlocked { return "lock.fill" }
+    if isCurrentlyBlocking { return "lock.fill" }
     return "lock.open"
   }
 
@@ -52,9 +52,21 @@ final class BridgeState: ObservableObject {
     return "Blocked"
   }
 
-  /// What the filter is actually told. Diverges from raw iCloud state only
-  /// when the emergency override is active.
-  var effectiveBlocked: Bool {
+  /// True iff the filter is actively dropping flows right now. Combines all
+  /// suppression sources: raw iCloud `isBlocked`, plus break, pause, and the
+  /// local emergency override. Drives the menu-bar lock icon and the header
+  /// status. Note: this is UI-only; what we actually send to the filter is
+  /// `publishedBlocked`, which omits break/pause so the filter side reasons
+  /// about those locally (matches `BlocklistState.shouldBlock`).
+  var isCurrentlyBlocking: Bool {
+    isBlocked && !emergencyOverrideActive && !isBreakActive && !isPauseActive
+  }
+
+  /// What we publish to the filter as `isBlocked`. Diverges from raw iCloud
+  /// only when the local emergency override is engaged. Break/pause are
+  /// passed through as their own flags so the filter's `BlocklistState` does
+  /// the actual suspension logic.
+  private var publishedBlocked: Bool {
     isBlocked && !emergencyOverrideActive
   }
 
@@ -126,7 +138,7 @@ final class BridgeState: ObservableObject {
 
   private func publishEffectiveState() {
     IPCClient.shared.publish(
-      isBlocked: effectiveBlocked,
+      isBlocked: publishedBlocked,
       isBreakActive: isBreakActive,
       isPauseActive: isPauseActive,
       domains: domains

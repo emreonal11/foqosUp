@@ -45,6 +45,10 @@ final class BlocklistState: @unchecked Sendable {
     let snap = snapshot
     lock.unlock()
     guard snap.isBlocked, !snap.isBreakActive, !snap.isPauseActive else { return false }
+    return matches(host, in: snap)
+  }
+
+  private func matches(_ host: String, in snap: BlocklistSnapshot) -> Bool {
     let h = host.lowercased()
     for entry in snap.domains where !entry.isEmpty {
       let e = entry.lowercased()
