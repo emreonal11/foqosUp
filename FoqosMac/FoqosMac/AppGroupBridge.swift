@@ -9,7 +9,10 @@ import OSLog
 enum AppGroupConstants {
   static let suiteName = "group.com.usetessera.mybrick"
   static let blocklistSnapshotKey = "com.usetessera.mybrick.blocklist.v1"
-  static let stateChangedDarwinName = "com.usetessera.mybrick.state.changed"
+  /// Darwin notification name. MUST be prefixed with the App Group identifier;
+  /// sandboxed processes can only post/subscribe to Darwin notifications whose
+  /// names live under one of their entitled App Groups.
+  static let stateChangedDarwinName = "group.com.usetessera.mybrick.state.changed"
 }
 
 /// Wire-format payload that crosses container ↔ filter via App Group

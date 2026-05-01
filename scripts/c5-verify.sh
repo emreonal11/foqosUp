@@ -18,7 +18,7 @@ DEPLOYED=/Applications/FoqosMac.app
 DERIVED_BASE="$HOME/Library/Developer/Xcode/DerivedData"
 SUITE=group.com.usetessera.mybrick
 KEY=com.usetessera.mybrick.blocklist.v1
-DARWIN_NAME=com.usetessera.mybrick.state.changed
+DARWIN_NAME=group.com.usetessera.mybrick.state.changed
 OUT="$(dirname "$0")/c5-verify.out"
 [ -f "$OUT" ] && [ ! -w "$OUT" ] && rm -f "$OUT" 2>/dev/null
 [ -f "$OUT" ] && [ ! -w "$OUT" ] && sudo rm -f "$OUT"
@@ -30,6 +30,13 @@ fail_clean() {
 }
 trap fail_clean ERR
 
+show_app_group() {
+  local label="$1"
+  local raw
+  raw=$(defaults read "$SUITE" "$KEY" 2>/dev/null || echo "(no key)")
+  say "  app-group state ($label): $(echo "$raw" | tr -d '\n' | head -c 200)"
+}
+
 inject_snapshot() {
   local json="$1"
   local hex
@@ -39,8 +46,10 @@ inject_snapshot() {
 }
 
 reset_snapshot() {
-  defaults delete "$SUITE" "$KEY" 2>/dev/null || true
-  swift -e "import CoreFoundation; import Foundation; CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFNotificationName(\"$DARWIN_NAME\" as CFString), nil, nil, true)"
+  # Write an explicit unblocked snapshot rather than deleting — guarantees
+  # cross-process cfprefsd cache visibility and matches what the container
+  # would publish for an unbricked iPhone.
+  inject_snapshot '{"isBlocked":false,"isBreakActive":false,"isPauseActive":false,"domains":[],"lastUpdated":0}'
 }
 
 curl_ok() {
@@ -74,9 +83,9 @@ check() {
 say "===== 1. Bump version + build + deploy ====="
 cd "$ROOT/FoqosMac"
 PRE=$(grep -m1 "CURRENT_PROJECT_VERSION" FoqosMac.xcodeproj/project.pbxproj | grep -oE '[0-9]+;' | tr -d ';')
-NEW=$((PRE + 1))
+NEW=$(date +%s)
 sed -i '' "s/CURRENT_PROJECT_VERSION = ${PRE};/CURRENT_PROJECT_VERSION = ${NEW};/g" FoqosMac.xcodeproj/project.pbxproj
-say "version: $PRE → $NEW"
+say "version: $PRE → $NEW (epoch — guaranteed unique per run)"
 
 pkill -9 -x FoqosMac 2>/dev/null || true
 pkill -9 -f "$EXT_BUNDLE" 2>/dev/null || true
@@ -109,6 +118,7 @@ say ""
 say "===== 2. Test 1: empty App Group → example.com should succeed ====="
 reset_snapshot
 sleep 2
+show_app_group "after reset"
 T1=$(curl -m 6 -sS -o /dev/null -w "%{http_code}" https://example.com 2>/dev/null || echo "000")
 say "  curl example.com → $T1"
 if [[ "$T1" =~ ^[23] ]]; then check "T1: example.com works (no blocklist)" "ok" "ok"; else check "T1: example.com works (no blocklist)" "ok" "blocked-or-failed:$T1"; fi
@@ -117,6 +127,7 @@ say ""
 say "===== 3. Test 2: inject {isBlocked: true, domains: [example.com]} ====="
 inject_snapshot '{"isBlocked":true,"isBreakActive":false,"isPauseActive":false,"domains":["example.com"],"lastUpdated":1}'
 sleep 2
+show_app_group "after inject blocked"
 T2=$(curl -m 6 -sS -o /dev/null -w "%{http_code}" https://example.com 2>/dev/null || echo "blocked")
 say "  curl example.com → $T2"
 if [[ "$T2" =~ ^[23] ]]; then check "T2: example.com blocked" "blocked" "ok:$T2"; else check "T2: example.com blocked" "blocked" "blocked"; fi
@@ -130,6 +141,7 @@ say ""
 say "===== 4. Test 3: isBreakActive=true suspends blocking ====="
 inject_snapshot '{"isBlocked":true,"isBreakActive":true,"isPauseActive":false,"domains":["example.com"],"lastUpdated":2}'
 sleep 2
+show_app_group "after inject break"
 T3=$(curl -m 6 -sS -o /dev/null -w "%{http_code}" https://example.com 2>/dev/null || echo "000")
 say "  curl example.com (break active) → $T3"
 if [[ "$T3" =~ ^[23] ]]; then check "T3: example.com works during break" "ok" "ok"; else check "T3: example.com works during break" "ok" "blocked:$T3"; fi
@@ -138,6 +150,7 @@ say ""
 say "===== 5. Test 4: subdomain match — block .example.com ====="
 inject_snapshot '{"isBlocked":true,"isBreakActive":false,"isPauseActive":false,"domains":["example.com"],"lastUpdated":3}'
 sleep 2
+show_app_group "after inject for subdomain"
 T4=$(curl -m 6 -sS -o /dev/null -w "%{http_code}" https://www.example.com 2>/dev/null || echo "blocked")
 say "  curl www.example.com (subdomain) → $T4"
 if [[ "$T4" =~ ^[23] ]]; then check "T4: www.example.com blocked (suffix match)" "blocked" "ok:$T4"; else check "T4: www.example.com blocked (suffix match)" "blocked" "blocked"; fi
@@ -146,6 +159,7 @@ say ""
 say "===== 6. Test 5: isBlocked=false → all allowed ====="
 inject_snapshot '{"isBlocked":false,"isBreakActive":false,"isPauseActive":false,"domains":["example.com"],"lastUpdated":4}'
 sleep 2
+show_app_group "after inject unblocked"
 T5=$(curl -m 6 -sS -o /dev/null -w "%{http_code}" https://example.com 2>/dev/null || echo "000")
 say "  curl example.com (isBlocked=false) → $T5"
 if [[ "$T5" =~ ^[23] ]]; then check "T5: example.com works when isBlocked=false" "ok" "ok"; else check "T5: example.com works when isBlocked=false" "ok" "blocked:$T5"; fi
@@ -153,14 +167,26 @@ if [[ "$T5" =~ ^[23] ]]; then check "T5: example.com works when isBlocked=false"
 sleep 2
 
 say ""
-say "===== 7. Filter logs ====="
+say "===== 7. FilterDataProvider logs ====="
 /usr/bin/log show --predicate "subsystem == 'com.usetessera.mybrick' AND category == 'FilterDataProvider'" \
-  --style compact --info --debug --start "$START_T_STR" 2>&1 | grep -E "(Reloaded|SNI|Darwin)" | tail -40 | tee -a "$OUT"
+  --style compact --info --debug --start "$START_T_STR" 2>&1 \
+  | grep -E "(startFilter|sanity|Filter settings|Reloaded|SNI|Darwin|stopFilter|apply)" \
+  | tail -50 | tee -a "$OUT"
 
 say ""
-say "===== 8. BlocklistState reload logs ====="
+say "===== 8. BlocklistState logs ====="
 /usr/bin/log show --predicate "subsystem == 'com.usetessera.mybrick' AND category == 'BlocklistState'" \
-  --style compact --info --debug --start "$START_T_STR" 2>&1 | tail -20 | tee -a "$OUT"
+  --style compact --info --debug --start "$START_T_STR" 2>&1 | tail -30 | tee -a "$OUT"
+
+say ""
+say "===== 9. ExtensionActivator logs ====="
+/usr/bin/log show --predicate "subsystem == 'com.usetessera.mybrick' AND category == 'ExtensionActivator'" \
+  --style compact --info --debug --start "$START_T_STR" 2>&1 | tail -15 | tee -a "$OUT"
+
+say ""
+say "===== 10. AppGroupBridge (container side) logs ====="
+/usr/bin/log show --predicate "subsystem == 'com.usetessera.mybrick' AND category == 'AppGroupBridge'" \
+  --style compact --info --debug --start "$START_T_STR" 2>&1 | tail -15 | tee -a "$OUT"
 
 say ""
 say "===== 9. Reset ====="
