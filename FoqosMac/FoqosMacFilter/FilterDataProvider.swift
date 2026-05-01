@@ -13,7 +13,15 @@ import OSLog
 final class FilterDataProvider: NEFilterDataProvider {
   private let log = Logger(subsystem: "com.usetessera.mybrick", category: "FilterDataProvider")
   private static let peekBytes = 4096  // ample for ClientHello (typical < 700 bytes)
-  private static let watchChunk = 65536  // 64 KB inspection chunks for blocklist-matching flows
+  /// `Int.max` for ongoing inspection — Apple's forum guidance for the
+  /// "watch every flow" pattern. The system delivers in natural-sized
+  /// chunks (typically 1 TCP segment, ~1-1.5 KB) rather than buffering up
+  /// to a fixed threshold. This is critical for HTTP/2: a 64 KB peek
+  /// threshold means a browsing session can fire dozens of small request
+  /// headers before our callback wakes up — too slow for state-change
+  /// reaction. With Int.max we're notified on each segment, so a state
+  /// change (break-end, rebrick) propagates within one user interaction.
+  private static let watchChunk = Int.max
 
   /// Every TLS flow we've extracted an SNI for. We keep them under
   /// continuing outbound-data inspection (rather than returning `.allow()`
@@ -126,7 +134,9 @@ final class FilterDataProvider: NEFilterDataProvider {
     if let sni = cachedSNI(for: flowID) {
       if BlocklistState.shared.shouldBlock(host: sni) {
         forgetFlow(flowID)
-        log.info("SNI DROP \(sni, privacy: .public) [retroactive — state changed]")
+        log.info(
+          "SNI DROP \(sni, privacy: .public) [retroactive — state changed, bytes=\(readBytes.count, privacy: .public)]"
+        )
         return .drop()
       }
       // Still allowed. Pass these bytes through and peek the next chunk.
