@@ -77,6 +77,12 @@ final class ExtensionActivator: NSObject, @unchecked Sendable {
             } else {
               self.log.info("Filter active and enabled")
               self.update(.activeAndConfigured)
+              // Force re-publish: the publish triggered by BridgeState.init's
+              // first refresh() likely raced extension activation and hit a
+              // dead XPC connection. resetDedup ensures the next refresh
+              // round-trips even if state hasn't materially changed.
+              IPCClient.shared.resetDedup()
+              self.state?.refresh()
             }
           }
         }

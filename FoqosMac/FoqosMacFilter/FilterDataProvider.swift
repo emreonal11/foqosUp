@@ -2,11 +2,14 @@ import Network
 import NetworkExtension
 import OSLog
 
-/// macOS Tahoe surfaces `remoteFlowEndpoint` as resolved IP for nearly every
+/// macOS Tahoe surfaces `remoteFlowEndpoint` as a resolved IP for nearly every
 /// client (Safari, Chrome, curl). Hostname-based blocking only works via SNI
-/// inspection from `handleOutboundData`. So `handleNewFlow` always asks for
+/// inspection from `handleOutboundData`, so `handleNewFlow` always asks for
 /// peek-outbound when the endpoint is an IP, and the actual block decision
 /// happens in `handleOutboundData` after parsing the TLS ClientHello.
+///
+/// State arrives via XPC from the container app — see IPCService.swift for
+/// the rationale (NE sysext UID-split makes App Group UserDefaults unusable).
 final class FilterDataProvider: NEFilterDataProvider {
   private let log = Logger(subsystem: "com.usetessera.mybrick", category: "FilterDataProvider")
   private static let peekBytes = 4096  // ample for ClientHello (typical < 700 bytes)
@@ -17,9 +20,9 @@ final class FilterDataProvider: NEFilterDataProvider {
       SNIParserSanityCheck.runOnce { [log] msg in log.info("\(msg, privacy: .public)") }
     #endif
 
-    // Initial state load + observer for live updates from the container.
-    BlocklistState.shared.reloadFromAppGroup()
-    setupDarwinObserver()
+    // State pushes in over XPC; until the container connects and publishes,
+    // BlocklistState stays at .empty and we fail open.
+    IPCService.shared.startListener()
 
     let settings = NEFilterSettings(rules: [], defaultAction: .filterData)
     apply(settings) { [log] error in
@@ -37,7 +40,6 @@ final class FilterDataProvider: NEFilterDataProvider {
     completionHandler: @escaping () -> Void
   ) {
     log.info("stopFilter reason=\(String(describing: reason), privacy: .public)")
-    removeDarwinObserver()
     completionHandler()
   }
 
@@ -113,31 +115,5 @@ final class FilterDataProvider: NEFilterDataProvider {
     let drop = BlocklistState.shared.shouldBlock(host: sni)
     log.info("SNI \(drop ? "DROP" : "allow", privacy: .public) \(sni, privacy: .public)")
     return drop ? .drop() : .allow()
-  }
-
-  // MARK: - Darwin notification (container → filter signal to reload state)
-
-  private func setupDarwinObserver() {
-    let center = CFNotificationCenterGetDarwinNotifyCenter()
-    let observer = Unmanaged.passUnretained(self).toOpaque()
-    CFNotificationCenterAddObserver(
-      center,
-      observer,
-      { (_, observerPtr, _, _, _) in
-        guard let observerPtr else { return }
-        let me = Unmanaged<FilterDataProvider>.fromOpaque(observerPtr).takeUnretainedValue()
-        me.log.info("Darwin: state.changed — reloading from App Group")
-        BlocklistState.shared.reloadFromAppGroup()
-      },
-      AppGroupConstants.stateChangedDarwinName as CFString,
-      nil,
-      .deliverImmediately
-    )
-  }
-
-  private func removeDarwinObserver() {
-    let center = CFNotificationCenterGetDarwinNotifyCenter()
-    let observer = Unmanaged.passUnretained(self).toOpaque()
-    CFNotificationCenterRemoveEveryObserver(center, observer)
   }
 }

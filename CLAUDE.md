@@ -548,55 +548,47 @@ Known cosmetic issue (non-blocking, not a real compile error):
 - ✅ **QUIC blackhole** (`7ada398`): all UDP/443 flows dropped at `handleNewFlow`. Browser HTTP/3 over QUIC carries TLS handshake in encrypted CRYPTO frames — SNI parser can't see anything. Drop forces TCP+TLS fallback (~50ms penalty) where SNI inspection works.
 - ✅ Verified end-to-end via `curl -v --max-time 8 https://example.com`: returns `Recv failure: Socket is not connected` (curl exit 35, SSL handshake aborted by `.drop()`). `curl https://google.com` returns 301. `SNI DROP example.com` log lines fire on every fresh attempt.
 
-**In progress (Phase C5 — drive blocklist from iCloud-mirrored App Group state)** (commits `d1d4c65`, `c95d9f5` — **BLOCKED, see Phase C5 BLOCKER section below**):
-- ✅ Code written and committed:
-  - `FoqosMac/FoqosMac/AppGroupBridge.swift`: `BlocklistSnapshot` Codable struct + singleton `AppGroupBridge.publish(...)`. Encodes JSON, writes to `UserDefaults(suiteName: "group.com.usetessera.mybrick")` with key `"com.usetessera.mybrick.blocklist.v1"`, posts Darwin notification `"group.com.usetessera.mybrick.state.changed"`. Dedups against last-published snapshot.
-  - `BridgeState.refresh()`: now calls `AppGroupBridge.shared.publish(...)` after iCloud KV reads.
-  - `FoqosMacFilter/BlocklistState.swift`: identical-schema `BlocklistSnapshot` + `@unchecked Sendable` singleton with NSLock-guarded snapshot. `shouldBlock(host:)` does the full suspended-active check + suffix match. `reloadFromAppGroup()` reads JSON from App Group UserDefaults.
-  - `FilterDataProvider`: removed hardcoded `Set<String>(["example.com"])`. `startFilter` calls `BlocklistState.shared.reloadFromAppGroup()` + `setupDarwinObserver()`. Both `handleNewFlow` (.name path) and `handleOutboundData` (SNI path) call `BlocklistState.shared.shouldBlock(host:)`. Darwin observer uses `Unmanaged.passUnretained / fromOpaque` pattern.
-- ⚠️ **Verification: PARTIALLY FAILS**. `scripts/c5-verify.sh` runs 6 assertions; 4 pass (T1, T2-google, T2, T4); 2 fail (T1-example, T5). The pattern is consistent: every test where we expect `example.com` to load via curl gets `curl: (35)` instead, while the SNI DROP log lines fire on `example.com`. Container's published state at startup is still in effect — the test injections aren't reaching the filter.
+**Done (Phase C5 — drive blocklist from iCloud-mirrored state via XPC)** (initial App Group attempt: commits `d1d4c65`, `c95d9f5`; XPC pivot: this commit):
+- ⚠️ First attempt used App Group `UserDefaults(suiteName:)` + Darwin notifications. **Failed at runtime** — container could never deliver state to the filter. See "Phase C5 root cause" below.
+- ✅ Pivoted to NSXPCConnection (Apple's canonical sysext↔container IPC):
+  - `FoqosMac{,Filter}/BlocklistService.swift`: `@objc(FoqosBlocklistService) protocol BlocklistService` declaration. Identical decl in both target source dirs (synchronized groups; no pbxproj exception needed). Single method: `updateBlocklist(_ data: Data, withReply reply: @escaping (Bool) -> Void)`. Wire format: JSON-encoded `BlocklistSnapshot`.
+  - `FoqosMacFilter/IPCService.swift`: `NSXPCListener(machServiceName: "group.com.usetessera.mybrick.FoqosMacFilter")` (reuses the existing NEMachServiceName from Info.plist — NetworkExtension's internal sysextd↔filter channel is kernel-private, so app-level XPC on the same Mach name doesn't collide). Accepts incoming connections, decodes the JSON snapshot, swaps it into `BlocklistState` atomically.
+  - `FoqosMac/IPCClient.swift`: persistent `NSXPCConnection` to the same Mach name. Invalidation/interruption handlers null the cached connection so the next `publish(...)` recreates it. Producer-side dedup against `lastPublished` skips no-op iCloud chatter.
+  - `FoqosMacFilter/BlocklistState.swift`: now a pure in-memory cache. `update(_:)` is the only mutator (called by IPCService); `shouldBlock(host:)` reads under NSLock. No I/O.
+  - `FoqosMacFilter/FilterDataProvider.startFilter`: `IPCService.shared.startListener()` instead of the old App-Group-reload + Darwin-observer dance. `stopFilter` no longer needs cleanup.
+  - `FoqosMac/ExtensionActivator.saveToPreferences` success callback: forces `IPCClient.shared.resetDedup()` + `state?.refresh()` so the first publish at app launch (which raced extension activation and likely hit a dead XPC connection) gets retried as soon as the listener is up.
+- ✅ Removed: `FoqosMac/AppGroupBridge.swift`, `BlocklistState.reloadFromAppGroup()`, the `setupDarwinObserver`/`removeDarwinObserver` methods + the `Unmanaged.passUnretained` dance, `AppGroupConstants` enums on both sides, all `defaults.synchronize()` calls.
+- ✅ Kept: `BlocklistSnapshot` Codable (still the wire format, just over XPC instead of UserDefaults), `BlocklistState` class with NSLock-guarded snapshot + `shouldBlock(host:)` matching, the `com.apple.security.application-groups` entitlement (still required to validate `NEMachServiceName`).
+- ✅ `scripts/c5-verify.sh` rewritten: synthetic shell injection removed (it could never reach a root sysext anyway). Now asserts XPC handshake (filter logs `XPC listener started`, `XPC client connected`, `Snapshot received`; container logs `Published:`) within a few seconds of launch, plus an optional real-iPhone block test gated on `TEST_BLOCKED_DOMAIN` env var.
 
-### Phase C5 BLOCKER (active investigation, hand off here)
+### Phase C5 root cause — verbatim diagnostic evidence
 
-**Problem**: `scripts/c5-verify.sh` injects synthetic snapshots via `defaults write group.com.usetessera.mybrick com.usetessera.mybrick.blocklist.v1 -data <hex>` then posts a Darwin notification. The filter receives the Darwin notification and calls `BlocklistState.reloadFromAppGroup()` — confirmed via logs (`Darwin: state.changed — reloading from App Group`). But every reload logs `No snapshot in App Group; using empty (fail-open).` even though `defaults read` from the shell shows the data is present.
+The original App Group + Darwin design failed because **NEFilterDataProvider system extensions run as root (UID 0) under their own per-root sandbox container, so `UserDefaults(suiteName:)` resolves to a different physical plist than the user-level container app's writes ever touch.** Apple DTS has documented this on their Developer Forums:
 
-**The smoking-gun discovery** (run `ls -la ~/Library/Preferences/group.com.usetessera.mybrick.plist ~/Library/Group\ Containers/group.com.usetessera.mybrick/Library/Preferences/group.com.usetessera.mybrick.plist`):
+> *"App groups aren't as useful in a sysex as they are in an appex because your sysex runs as root, and thus can't share a group container with its containing app."* — Quinn "The Eskimo!", thread 763433
 
-There are **two physical plist files**, with different content:
-- `~/Library/Preferences/group.com.usetessera.mybrick.plist` (179 bytes) — written by **shell** `defaults write group.X` (non-sandboxed process)
-- `~/Library/Group Containers/group.com.usetessera.mybrick/Library/Preferences/group.com.usetessera.mybrick.plist` (209 bytes) — written by the **sandboxed container app** `UserDefaults(suiteName:)`
+> *"The problem with your setup is that your two programs are running as different users. The sysex runs as root and the container app runs as the logged in user. This will result in two different `container` paths… If I were in your situation I'd probably just switch to using XPC."* — Quinn "The Eskimo!", thread 133543
 
-The CONTAINER successfully writes to #2 (verified via timestamps + content showing the iCloud-derived `instagram.com`). The shell test writes to #1. They're separate files; shell writes are invisible to sandboxed processes.
+Confirmed verbatim on this machine via `scripts/c5-lsof-check.sh`:
 
-**But the deeper problem**: even when only the container is writing to file #2, the **filter (running as root)** still logs "No snapshot in App Group" on its first `reloadFromAppGroup` call at `startFilter`. The container's write to #2 happens *before* the filter's reload (verified by timestamp ordering: container "Published" at 03:07:26.141, filter init at 03:07:27.371, first reload at 03:07:27.377). The filter should see the container's bytes — but doesn't.
+```
+Filter PID: 83030  UID 0 (root)
+  cwd → /private/var/root/Library/Containers/<filter-bundle-id>/Data
+Container PID: 82983  UID 501 (emreonal)
+  cwd → /Users/emreonal/Library/Containers/<container-bundle-id>/Data
 
-**Most likely root cause** (untested hypothesis): **macOS System Extensions run as root (UID 0). UserDefaults(suiteName:) with the App Group entitlement reads from a per-user App Group container path. The user's container path (`/Users/emreonal/Library/Group Containers/...`) is owned by user 501. The filter (root) may be reading from `/var/root/Library/Group Containers/...` or some other system-wide path — empty.** Container (running as user 501) writes to user 501's path, filter (root) reads its own root path — they never share.
+/var/root/Library/Group Containers/group.com.usetessera.mybrick/Library/Preferences/
+  → empty (no plist)
+/Users/emreonal/Library/Group Containers/group.com.usetessera.mybrick/Library/Preferences/
+  → group.com.usetessera.mybrick.plist (209 bytes, container's published snapshot)
 
-**Diagnostic data**:
+sudo defaults read group.com.usetessera.mybrick com.usetessera.mybrick.blocklist.v1
+  → "The domain/default pair … does not exist"
+```
 
-Filter PID seen in logs is owned by UID 0 (root), per the c4-redeploy.out earlier (`0   72231     1   0  1:13AM ?? ... /Library/SystemExtensions/.../com.usetessera.mybrick.FoqosMac.FoqosMacFilter`).
+This is the canonical sysext UID split: even when the container correctly writes to its user-side App Group plist, the filter (root) reads from `/var/root/...` and sees nothing. Apple's `SimpleFirewall` sample uses NSXPCConnection over the filter's NEMachServiceName for exactly this reason.
 
-Container PID is owned by UID 501.
-
-Apple's NetworkExtension samples (SimpleFirewall, etc.) reportedly use **NSXPCConnection** for container ↔ filter IPC, NOT App Group UserDefaults. Possible interpretation: App Group UserDefaults doesn't actually work for sysext-container IPC due to this UID split, and Apple's samples avoid it by using XPC. But this needs verification; it's a hypothesis.
-
-**Investigation paths for the next session** (in order of effort):
-1. **Confirm the UID split hypothesis** by checking what files the filter process actually has open. Run as user with sudo: `sudo lsof -p $(pgrep -f FoqosMacFilter)` and look for any `group.com.usetessera*` or root-side App Group container paths. Or `sudo find /var/root -name "group.com.usetessera*"`.
-2. **If different paths**: switch from App Group UserDefaults → NSXPCConnection. The Mach service name (`group.com.usetessera.mybrick.FoqosMacFilter`) is already in the filter's Info.plist — it's the same name the container's `OSSystemExtensionRequest` flow registers. Filter implements `NSXPCListener` with that mach service name; container connects via `NSXPCConnection(machServiceName:)`. State updates become method calls. Reference: Apple's SimpleFirewall sample.
-3. **If same paths but cache issue**: try `defaults.synchronize()` more aggressively, or use `CFPreferencesAppSynchronize` directly. Less likely root cause given the UID split fits the symptom better.
-4. **If UID split confirmed but XPC is too heavy**: file-based IPC at a known path both root and user 501 can read/write. E.g., `/Library/Application Support/MyBrick/state.json` (writable by admin group, readable by everyone). Container writes, filter reads + watches with `DispatchSource.makeFileSystemObjectSource`. Lower fidelity than XPC but simpler.
-
-**Recommended path**: option 2 (NSXPCConnection). Apple's canonical pattern, well-documented. ~150 LOC additional but solves the UID split definitively. This is the correct senior-SWE answer if the hypothesis is confirmed.
-
-**The actual end-to-end test the user wants to see** (independent of how IPC is solved):
-1. Brick iPhone with profile containing `instagram.com`
-2. Wait ~2s (iCloud sync + container publish)
-3. Open Chrome (incognito to avoid cache)
-4. Navigate to https://instagram.com
-5. Should fail with TCP-level error
-6. Unbrick → instagram.com loads again
-
-**Pending (Phase C6 — real-iPhone end-to-end)**: just the test above, blocked on C5.
+**Pending (Phase C6 — real-iPhone end-to-end)**: brick iPhone with `instagram.com` in profile, wait ~2s, `curl -v --max-time 8 https://instagram.com` → expect `curl: (35)`. Unbrick → expect 200/301. Unblocked once C5 verify passes locally.
 
 **Pending (Phase D — Chrome SNI inspection)**: ✓ DONE (see above).
 
@@ -606,14 +598,6 @@ Apple's NetworkExtension samples (SimpleFirewall, etc.) reportedly use **NSXPCCo
 3. ✓ `LSUIElement = YES` already done in C0
 4. Emergency override (4-digit PIN in Keychain, local-only, doesn't write to iCloud — see §6)
 5. Notarize for personal use (avoids Gatekeeper warnings on rebuild). Also: Developer ID signing required for `-systemextension` entitlement variant.
-6. Custom AppIcon (currently default Xcode template)
-
-**Pending (Phase E — Polish)**:
-1. SMAppService login-at-startup (`SMAppService.mainApp.register()`)
-2. Custom menu bar icon (currently uses SF Symbol `lock.fill` / `lock.open`)
-3. `LSUIElement = true` in Info.plist to hide Dock icon (currently shows in both Dock + menu bar)
-4. Emergency override (4-digit PIN in Keychain, local-only, doesn't write to iCloud — see §6)
-5. Notarize for personal use (avoids Gatekeeper warnings on rebuild)
 6. Custom AppIcon (currently default Xcode template)
 
 ### Cross-cutting learnings from Phase C, D, C5 (preserve for future sessions)
@@ -627,7 +611,9 @@ Apple's NetworkExtension samples (SimpleFirewall, etc.) reportedly use **NSXPCCo
 - **`/Applications` is required for sysext install on macOS Tahoe 26**, even with `systemextensionsctl developer on`. The `developer on` mode relaxes signing checks but NOT the location requirement. All dev iteration must deploy to `/Applications/FoqosMac.app` before `OSSystemExtensionRequest` will succeed.
 - **`systemextensionsctl developer on` requires SIP off.** User has SIP on, so this command failed. We worked around it by deploying to /Applications directly (which works without dev-mode). Uninstalling old extension versions also requires SIP off — instead they get marked "terminated waiting to uninstall on reboot" and pile up in `systemextensionsctl list` until reboot.
 - **`PBXFileSystemSynchronizedRootGroup` (Xcode 26.x default, `objectVersion = 77`)**: files in a target's source dir auto-included in the build. New `.swift` files don't need pbxproj membership entries. `Info.plist` is excluded via `PBXFileSystemSynchronizedBuildFileExceptionSet` because it's referenced by `INFOPLIST_FILE` build setting instead of being a source.
-- **NEFilterDataProvider runs as root, container runs as user 501** — App Group UserDefaults storage paths are per-user. Container writes to `/Users/emreonal/Library/Group Containers/...`; filter (as root) likely reads from `/var/root/Library/Group Containers/...` (different file). This is the active C5 blocker. Apple's NetworkExtension samples reportedly use NSXPCConnection for container↔filter IPC, not App Group UserDefaults. See Phase C5 BLOCKER section above for full diagnostic.
+- **NEFilterDataProvider sysext runs as root (UID 0); container runs as the logged-in user.** Their `UserDefaults(suiteName:)` App Group paths are physically disjoint — the filter resolves to `/var/root/Library/Group Containers/...` while the container resolves to `/Users/<u>/Library/Group Containers/...`. **App Group UserDefaults / Darwin notifications cannot be used for sysext↔container IPC.** Apple DTS (Quinn the Eskimo, threads 133543 + 763433) explicitly recommends NSXPCConnection over the filter's NEMachServiceName instead; this is what `SimpleFirewall` does. We hit this wall in Phase C5 first-attempt, then pivoted to XPC. See "Phase C5 root cause" above for the verbatim lsof + DTS evidence.
+- **`NSXPCListener.machServiceName` can reuse the filter's `NEMachServiceName`.** NetworkExtension's internal sysextd↔filter channel is kernel-private and disjoint from app-level XPC, so registering a user-facing NSXPCListener with the same Mach name doesn't collide. SimpleFirewall does exactly this. One Mach name → one NSXPCListener; do not register a second.
+- **At app launch the first XPC publish races extension activation.** `BridgeState.init()` calls `refresh()` (which publishes) before `OSSystemExtensionRequest`'s callback chain finishes — so the filter listener may not be up yet and the publish silently fails. Fix: in `ExtensionActivator.saveToPreferences` success, call `IPCClient.shared.resetDedup()` + `state?.refresh()` to force a republish. Also: invalidation/interruption handlers null the cached `NSXPCConnection` and clear `lastPublished`, so subsequent failures self-heal on the next iCloud refresh.
 - **Sandbox blocks `xcodebuild` + `log show` + `/Applications` writes from Claude's environment.** Build/deploy/test must run from the user's terminal. Claude can edit source files but can't drive the dev cycle without user-side scripts. `scripts/c5-verify.sh` is the canonical "I edit code → user runs script → I read output" loop.
 - **Logger.info messages are filtered out of `log show` by default**. Need `--info --debug` flags to see them. Initial diagnostic runs missed all FilterDataProvider activity because of this — false impression that "filter isn't running" when it just wasn't logging at the visible level. Always include `--info --debug` in log show predicates for our subsystem.
 - **`defaults` command name conflict**: don't name a bash function `log` — it shadows the macOS `log` CLI tool. Use `say` or similar for log helpers.
@@ -752,152 +738,72 @@ Build/run output files. Gitignored via `scripts/*.out` rule. The `.c4-build.log`
 ```
 Continuing the MyBrick / FoqosUp project at ~/projects/FoqosUp/.
 
-STEP 1: read CLAUDE.md in full. It is the SSOT. Especially:
+STEP 1: read CLAUDE.md in full. SSOT. Most important sections:
   - §1 (project intent — cooperative self-blocking; iPhone NFC bricks Mac too)
-  - §11 "Where we are right now" — full execution state through Phase C5
-  - §11 "Phase C5 BLOCKER" — the active investigation
-  - §11 cross-cutting learnings sections — failure modes already discovered
+  - §11 "Where we are right now" — execution state through Phase C5 (XPC)
+  - §11 "Phase C5 root cause" — the UID-split diagnostic + DTS quotes
+  - §11 cross-cutting learnings — failure modes already discovered
   - §6 macOS Mac app architecture
   - §16 dev workflow scripts
 
-STEP 2: read git log to confirm state.
+STEP 2: confirm state via git log.
   cd ~/projects/FoqosUp && git log --oneline -15
 
-  Expected last commits (newest first):
-    c95d9f5 C5 fix: App-Group-prefixed Darwin name + epoch version + diagnostics
-    d1d4c65 C5: drive blocklist from iCloud-mirrored App Group state
-    7ada398 D fix: QUIC blackhole — drop UDP/443 to force TCP+TLS fallback
-    db68a5f D: SNI inspection — extract destination hostname from TLS ClientHello
-    1689966 C4 verified: pipeline drops flows; hostname surfacing is Phase D
-    169d5e1 C4 fix: NEMachServiceName must be prefixed with the App Group
-    03f696c C4: hardcoded example.com block — proof of life
-    26c2ad9 C3: ExtensionActivator + auto-activate on first launch
-    54e8d13 C2 fix: switch to content-filter-provider (legacy) for dev signing
-    80e9adf C2: configure entitlements for content-filter system extension
-    0dfaa45 C1: add FoqosMacFilter System Extension target
-    7863e20 C0: split FoqosMacApp.swift, hide Dock icon
-    2750995 Doc fixes: sandbox policy + synchronized file groups
+  Most recent commit should be the C5 XPC pivot. Earlier commits (Phase D,
+  C4, C3, C2, C1, C0, Phase B, Phase A) are documented in §11.
 
-STEP 3: orient yourself on the C5 blocker.
+STEP 3: where things stand.
 
-WHAT WORKS (verified end-to-end):
+WHAT WORKS (verified end-to-end through Phase D, C5 verification next):
   - iCloud bridge iOS↔Mac (Phase A+B): brick iPhone → Mac dropdown shows
-    isBlocked=true, domains=[instagram.com], in 1-2s
-  - System Extension install + activation (Phase C1-C4)
-  - SNI parser + drop pipeline (Phase D): curl https://example.com fails with
-    `curl: (35) Recv failure: Socket is not connected`, curl https://google.com
-    succeeds. Verified via scripts/c4-verify.sh and earlier c5-verify.sh runs.
-  - QUIC blackhole (UDP/443 drop) forces TCP+TLS fallback for Chrome/HTTP3.
-  - App Group entitlement is correctly configured on both targets.
-  - Container's AppGroupBridge.publish writes BlocklistSnapshot JSON to
-    UserDefaults(suiteName: "group.com.usetessera.mybrick") successfully —
-    confirmed by direct file inspection.
-  - Filter receives Darwin notifications correctly when posted with
-    App-Group-prefixed name "group.com.usetessera.mybrick.state.changed" —
-    confirmed by "Darwin: state.changed — reloading from App Group" logs.
-  - BlocklistState.reloadFromAppGroup() is called on every notification —
-    confirmed by "No snapshot in App Group; using empty (fail-open)" logs.
+    isBlocked=true, domains=[instagram.com], in 1-2s.
+  - System Extension install + activation (Phase C1-C4).
+  - SNI parser + drop pipeline (Phase D): hostname-based blocking via TLS
+    ClientHello inspection from handleOutboundData. QUIC blackhole forces
+    TCP+TLS fallback for HTTP/3 clients.
+  - Container ↔ filter IPC via NSXPCConnection (Phase C5): container's
+    BridgeState.refresh() pushes JSON-encoded BlocklistSnapshot through
+    IPCClient → filter's IPCService → BlocklistState.update(). Replaces the
+    earlier App Group UserDefaults + Darwin design which was unrecoverable
+    due to the sysext UID split (filter runs as root, sees /var/root/...;
+    container runs as user, writes to /Users/.../). DTS-confirmed; lsof
+    evidence in commit body.
 
-WHAT'S BROKEN:
-  Filter logs "No snapshot in App Group" on every reload, even after the
-  container has written successfully and even after shell scripts inject
-  synthetic snapshots. The two readers (sandboxed user-process container
-  and root-process filter sysextension) appear to be reading DIFFERENT
-  physical files for the same App Group identifier.
+WHAT'S NEXT (Phase C6 — real-iPhone end-to-end test):
+  1. Run scripts/c5-verify.sh — should pass 4/4 XPC handshake assertions
+     plus the apple.com sanity check.
+  2. With iPhone bricked (profile containing instagram.com), set
+     TEST_BLOCKED_DOMAIN=instagram.com and re-run scripts/c5-verify.sh,
+     OR run curl -v --max-time 8 https://instagram.com manually and expect
+     curl: (35) Recv failure. Unbrick the iPhone, wait ~2s, expect 200/301.
+  3. If both pass, mark Phase C6 ✅ DONE in CLAUDE.md §11.
 
-KEY DIAGNOSTIC EVIDENCE:
-  Two physical plists exist:
-    ~/Library/Preferences/group.com.usetessera.mybrick.plist
-    ~/Library/Group Containers/group.com.usetessera.mybrick/Library/Preferences/group.com.usetessera.mybrick.plist
-
-  - Shell `defaults write group.X` writes to #1 (visible to non-sandboxed shells)
-  - Container's UserDefaults(suiteName:) writes to #2 (sandboxed user-process)
-  - Filter's UserDefaults(suiteName:) reads ?? — claims "no data" even
-    when #2 contains data the container just wrote
-
-  Most likely root cause: SystemExtension runs as root (UID 0) in
-  /Library/SystemExtensions/.../FoqosMacFilter.systemextension. UserDefaults
-  resolves App Group containers per-user. Filter (root) likely reads from
-  /var/root/Library/Group Containers/ — empty. Container (user 501) writes
-  to /Users/emreonal/Library/Group Containers/. Different files,
-  cross-process IPC fails.
-
-  Hypothesis to confirm:
-    sudo lsof -p $(pgrep -f FoqosMacFilter) | grep -i "group.com.usetessera"
-    sudo find /var/root -name "group.com.usetessera*" 2>/dev/null
-    sudo find /Library -name "group.com.usetessera*" 2>/dev/null
-
-STEP 4: pick a path forward. Strong recommendation: NSXPCConnection.
-
-  Apple's NEFilterDataProvider samples (SimpleFirewall etc.) reportedly use
-  NSXPCConnection between container and filter, not App Group UserDefaults.
-  This is the canonical pattern that handles the UID split.
-
-  Approximate plan for XPC pivot (~150 LOC):
-    1. Filter implements NSXPCListener with the existing NEMachServiceName
-       (already configured: "group.com.usetessera.mybrick.FoqosMacFilter").
-       The Mach service is already registered for the filter — reuse it.
-    2. Define a @objc protocol BlocklistService { func updateBlocklist(...) }
-    3. Filter sets listener.delegate, accepts new connections, exports
-       BlocklistService via NSXPCInterface.
-    4. Container creates NSXPCConnection(machServiceName:options:.privileged
-       or [] depending on Apple's recommendation for sysext IPC).
-    5. AppGroupBridge.publish(...) becomes XPCBridge.publish(...) — calls
-       the remote BlocklistService method.
-    6. Remove App Group + Darwin notification approach. Keep the
-       BlocklistSnapshot Codable struct as the wire format (sent as Data
-       via NSXPCConnection).
-    7. Update scripts/c5-verify.sh's synthetic injection to also use XPC
-       (small Swift CLI helper) or just rely on real-iPhone test.
-
-  Alternative path if XPC seems too heavy: file-based IPC at a known path
-  both root and user 501 can access. E.g., /Library/Application Support/
-  MyBrick/state.json (writable by admin group). Container writes, filter
-  reads + watches with DispatchSource.makeFileSystemObjectSource. Lower
-  fidelity than XPC but avoids the UID split.
-
-  DO NOT skip the investigation step. Confirm the UID split hypothesis
-  with lsof before committing to XPC. Senior-SWE approach: ground-truth
-  the actual problem before pivoting architecture.
-
-STEP 5: Re-verify your fix.
-
-  Once IPC is working:
-    1. Run scripts/c5-verify.sh — should now pass 6/6 if synthetic injection
-       still works (depends on whether you keep the `defaults write` test or
-       switch to XPC for synthetic state too).
-    2. The real test: brick iPhone with profile containing example.com or
-       instagram.com, run curl from Mac, expect block. Unbrick, expect curl
-       to succeed.
+WHAT'S AFTER (Phase E — polish, see §11):
+  - SMAppService login-at-startup
+  - Custom menu bar icon
+  - Emergency override (Keychain PIN)
+  - Notarize for personal use
+  - Custom AppIcon
 
 OPERATIONAL RULES:
-  - User has explicitly stated "rigor of senior Google SWE" is the bar.
-    Apply: clean modular code, ground-truth research before pivoting,
-    write tests that catch regressions, document trade-offs in commit
-    messages.
-  - Sandbox blocks: xcodebuild, log show, /Applications writes, sudo
-    commands needing user approval. The user runs scripts; you read
-    .out files. Don't ask the user to do things you can do yourself.
-  - User gets frustrated by long verbose responses + speculation cycles.
-    Be terse. Test before claiming. Trust git log.
-  - Build/test loop: edit code → tell user "run scripts/c5-verify.sh"
-    → read scripts/c5-verify.out → diagnose. Don't try to run xcodebuild
-    yourself — sandbox blocks it.
-  - SIP is ON, dev-mode is OFF. /Applications deployment + Apple Development
-    cert is the dev path. systemextensionsctl uninstall doesn't work without
-    SIP off; rely on actionForReplacingExtension's .replace verdict instead
-    (works fine for cdhash-different builds).
-  - User's iPhone is currently bricked with profile containing instagram.com
-    (per last container publish in logs). This means real-iPhone test is
-    available the moment IPC is fixed.
-
-STEP 6: cleanup before declaring victory.
-  - Once C5 is verified, commit a "doc fixes" commit updating CLAUDE.md
-    §11 to mark Phase C5 ✅ DONE and remove the BLOCKER section.
-  - Pause and report. Don't auto-proceed to Phase E.
+  - Senior-SWE rigor bar: clean modular code, ground-truth research before
+    pivoting, document trade-offs in commit messages, verbatim diagnostic
+    evidence in commit bodies (the C5 commit shows the pattern).
+  - Sandbox blocks xcodebuild, log show, /Applications writes, sudo from
+    Claude's environment. User runs scripts; Claude reads .out files.
+    Don't ask the user to do things Claude can do itself (file edits).
+  - Be terse. Test before claiming. Trust git log.
+  - SIP is ON, dev-mode is OFF. /Applications deployment + Apple
+    Development cert is the dev path. .replace verdict in
+    actionForReplacingExtension handles cdhash-different rebuilds; old
+    extension versions pile up as "terminated waiting to uninstall on
+    reboot" until reboot.
+  - When in doubt about libraries / Apple APIs, prefer context7 or
+    Apple Developer Forums (Quinn the Eskimo's threads are gold) over
+    web search.
 ```
 
 ---
 
 **Last fork sync**: Foqos 1.32.4 (commit `5ac998f`, 2026)
-**Document version**: 2026-05-01 — Phases A through D complete; Phase C5 (App Group → Darwin → filter IPC) BLOCKED on root-vs-user UID split. Phase C6 + Phase E pending.
+**Document version**: 2026-05-01 — Phases A through D + C5 complete (C5 pivoted from App Group UserDefaults → NSXPCConnection after confirming the sysext UID-split). Phase C6 (real-iPhone end-to-end) + Phase E (polish) pending.

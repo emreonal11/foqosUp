@@ -1,24 +1,10 @@
 import Foundation
 import OSLog
 
-/// Filter-side mirror of FoqosMac/AppGroupBridge.swift constants. Must stay
-/// in lock-step with the container's definition — these are the IPC contract.
-enum AppGroupConstants {
-  static let suiteName = "group.com.usetessera.mybrick"
-  static let blocklistSnapshotKey = "com.usetessera.mybrick.blocklist.v1"
-  /// Darwin notification name. MUST be prefixed with the App Group identifier;
-  /// sandboxed processes can only post/subscribe to Darwin notifications whose
-  /// names live under one of their entitled App Groups.
-  static let stateChangedDarwinName = "group.com.usetessera.mybrick.state.changed"
-}
-
-/// Filter-side copy of the wire payload. Identical Codable structure to the
-/// container's BlocklistSnapshot — they serialize to the same JSON bytes,
-/// which is the only thing that has to match. Duplicated because each Xcode
-/// target gets only its own synchronized-group source dir; sharing a single
-/// .swift file across both targets would require a pbxproj-level membership
-/// exception, which isn't worth the complexity for ~20 lines.
-struct BlocklistSnapshot: Codable, Equatable {
+/// JSON-encoded wire payload received over XPC from the container. Identical
+/// schema to FoqosMac/IPCClient.swift's struct of the same name; both sides
+/// must round-trip the same bytes through Codable.
+struct BlocklistSnapshot: Codable, Equatable, Sendable {
   let isBlocked: Bool
   let isBreakActive: Bool
   let isPauseActive: Bool
@@ -34,13 +20,12 @@ struct BlocklistSnapshot: Codable, Equatable {
   )
 }
 
-/// Thread-safe in-memory blocklist used by the FilterDataProvider hot path.
-/// Reads are uncontended NSLock acquires (~10ns each); writes happen on
-/// Darwin notification (low frequency). FilterDataProvider's handleNewFlow
-/// and handleOutboundData are serialized through Apple's per-filter queue
-/// (per Apple DTS), so write contention with reads is rare in practice but
-/// the lock is here for correctness on the off-chance the Darwin callback
-/// runs concurrently with a filter callback.
+/// In-memory blocklist consulted by the FilterDataProvider hot path. Pure
+/// cache — no I/O. State is pushed in via `update(_:)` from IPCService when
+/// the container app sends a fresh snapshot over XPC. Reads are lock-protected
+/// because Apple does not document whether per-flow callbacks (`handleNewFlow`
+/// / `handleOutboundData`) and XPC delivery threads share a serialization
+/// queue, and the lock is cheap (~10 ns uncontended).
 final class BlocklistState: @unchecked Sendable {
   static let shared = BlocklistState()
 
@@ -52,9 +37,9 @@ final class BlocklistState: @unchecked Sendable {
     log.info("BlocklistState initialized (default snapshot = empty)")
   }
 
-  /// Returns true iff blocking is currently active AND the host matches one
-  /// of the blocklist entries (suffix-matched, so "youtube.com" also blocks
-  /// "m.youtube.com" / "studio.youtube.com").
+  /// True iff blocking is active and `host` matches one of the blocklist
+  /// entries. Suffix match means "youtube.com" also blocks "m.youtube.com",
+  /// "studio.youtube.com", etc.
   func shouldBlock(host: String) -> Bool {
     lock.lock()
     let snap = snapshot
@@ -68,38 +53,14 @@ final class BlocklistState: @unchecked Sendable {
     return false
   }
 
-  /// Read the latest snapshot from App Group UserDefaults and atomically
-  /// swap. Called once at filter startup and on every Darwin notification.
-  func reloadFromAppGroup() {
-    guard let defaults = UserDefaults(suiteName: AppGroupConstants.suiteName) else {
-      log.error("App Group UserDefaults nil — entitlement / suite name mismatch?")
-      return
-    }
-
-    guard let data = defaults.data(forKey: AppGroupConstants.blocklistSnapshotKey) else {
-      lock.lock()
-      snapshot = .empty
-      lock.unlock()
-      log.info("No snapshot in App Group; using empty (fail-open).")
-      return
-    }
-
-    do {
-      let new = try JSONDecoder().decode(BlocklistSnapshot.self, from: data)
-      lock.lock()
-      snapshot = new
-      lock.unlock()
-      log.info(
-        "Reloaded: blocked=\(new.isBlocked, privacy: .public) break=\(new.isBreakActive, privacy: .public) pause=\(new.isPauseActive, privacy: .public) domains=\(new.domains.count, privacy: .public)"
-      )
-    } catch {
-      // Corrupt or schema-incompatible payload — fail open. Log so we notice.
-      log.error(
-        "Decode snapshot failed: \(error.localizedDescription, privacy: .public). Falling back to empty."
-      )
-      lock.lock()
-      snapshot = .empty
-      lock.unlock()
-    }
+  /// Atomically swap the in-memory snapshot. Called by IPCService when a new
+  /// snapshot arrives over XPC.
+  func update(_ new: BlocklistSnapshot) {
+    lock.lock()
+    snapshot = new
+    lock.unlock()
+    log.info(
+      "Updated: blocked=\(new.isBlocked, privacy: .public) break=\(new.isBreakActive, privacy: .public) pause=\(new.isPauseActive, privacy: .public) domains=\(new.domains.count, privacy: .public)"
+    )
   }
 }
