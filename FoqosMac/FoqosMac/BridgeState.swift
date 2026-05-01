@@ -50,6 +50,13 @@ final class BridgeState: ObservableObject {
     }
     let ts = store.double(forKey: BridgeKey.lastUpdated)
     lastUpdated = ts > 0 ? Date(timeIntervalSince1970: ts) : nil
+
+    AppGroupBridge.shared.publish(
+      isBlocked: isBlocked,
+      isBreakActive: isBreakActive,
+      isPauseActive: isPauseActive,
+      domains: domains
+    )
   }
 
   func forceSync() {

@@ -9,11 +9,6 @@ import OSLog
 /// happens in `handleOutboundData` after parsing the TLS ClientHello.
 final class FilterDataProvider: NEFilterDataProvider {
   private let log = Logger(subsystem: "com.usetessera.mybrick", category: "FilterDataProvider")
-
-  /// Hardcoded blocklist for C4/D verification. C5 replaces this with values
-  /// read from the App Group / iCloud-mirrored state.
-  private static let blocklist: Set<String> = ["example.com"]
-
   private static let peekBytes = 4096  // ample for ClientHello (typical < 700 bytes)
 
   override func startFilter(completionHandler: @escaping (Error?) -> Void) {
@@ -21,6 +16,11 @@ final class FilterDataProvider: NEFilterDataProvider {
     #if DEBUG
       SNIParserSanityCheck.runOnce { [log] msg in log.info("\(msg, privacy: .public)") }
     #endif
+
+    // Initial state load + observer for live updates from the container.
+    BlocklistState.shared.reloadFromAppGroup()
+    setupDarwinObserver()
+
     let settings = NEFilterSettings(rules: [], defaultAction: .filterData)
     apply(settings) { [log] error in
       if let error {
@@ -37,6 +37,7 @@ final class FilterDataProvider: NEFilterDataProvider {
     completionHandler: @escaping () -> Void
   ) {
     log.info("stopFilter reason=\(String(describing: reason), privacy: .public)")
+    removeDarwinObserver()
     completionHandler()
   }
 
@@ -66,8 +67,10 @@ final class FilterDataProvider: NEFilterDataProvider {
       // Should rarely fire on Tahoe — kernel resolves DNS before flows reach
       // the filter. Kept as a fast path in case any client surfaces a name.
       let lowered = name.lowercased()
-      let drop = Self.matches(host: lowered)
-      log.info("flow \(drop ? "DROP" : "allow", privacy: .public) \(lowered, privacy: .public) [direct hostname]")
+      let drop = BlocklistState.shared.shouldBlock(host: lowered)
+      log.info(
+        "flow \(drop ? "DROP" : "allow", privacy: .public) \(lowered, privacy: .public) [direct hostname]"
+      )
       return drop ? .drop() : .allow()
 
     case .ipv4, .ipv6:
@@ -102,20 +105,39 @@ final class FilterDataProvider: NEFilterDataProvider {
         else { return 0 }
         return p.rawValue
       }()
-      log.info("SNI nil [proto=\(proto, privacy: .public) port=\(port, privacy: .public) bytes=\(readBytes.count, privacy: .public)] — allowing")
+      log.info(
+        "SNI nil [proto=\(proto, privacy: .public) port=\(port, privacy: .public) bytes=\(readBytes.count, privacy: .public)] — allowing"
+      )
       return .allow()
     }
-    let drop = Self.matches(host: sni)
+    let drop = BlocklistState.shared.shouldBlock(host: sni)
     log.info("SNI \(drop ? "DROP" : "allow", privacy: .public) \(sni, privacy: .public)")
     return drop ? .drop() : .allow()
   }
 
-  /// Suffix-match against blocklist: blocking `youtube.com` also blocks
-  /// `m.youtube.com`, `studio.youtube.com`, etc.
-  private static func matches(host: String) -> Bool {
-    for entry in blocklist {
-      if host == entry || host.hasSuffix(".\(entry)") { return true }
-    }
-    return false
+  // MARK: - Darwin notification (container → filter signal to reload state)
+
+  private func setupDarwinObserver() {
+    let center = CFNotificationCenterGetDarwinNotifyCenter()
+    let observer = Unmanaged.passUnretained(self).toOpaque()
+    CFNotificationCenterAddObserver(
+      center,
+      observer,
+      { (_, observerPtr, _, _, _) in
+        guard let observerPtr else { return }
+        let me = Unmanaged<FilterDataProvider>.fromOpaque(observerPtr).takeUnretainedValue()
+        me.log.info("Darwin: state.changed — reloading from App Group")
+        BlocklistState.shared.reloadFromAppGroup()
+      },
+      AppGroupConstants.stateChangedDarwinName as CFString,
+      nil,
+      .deliverImmediately
+    )
+  }
+
+  private func removeDarwinObserver() {
+    let center = CFNotificationCenterGetDarwinNotifyCenter()
+    let observer = Unmanaged.passUnretained(self).toOpaque()
+    CFNotificationCenterRemoveEveryObserver(center, observer)
   }
 }
