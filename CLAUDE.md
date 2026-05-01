@@ -699,12 +699,12 @@ This is the canonical sysext UID split: even when the container correctly writes
 7. ✅ Filter behavior on state transitions — see §3 "Filter behavior on state transitions." `FilterDataProvider` now keeps every TLS flow under continuing inspection (`peekBytes = Int.max`) instead of returning `.allow()` and detaching. Existing TCP connections die on the next outbound chunk after a state change (break end, rebrick, blocklist mutation). Necessary because `NEFilterDataProvider` has no retroactive kill API for `.allow()`d flows; verified via Apple headers + DTS forum thread 735504. Cost: 0% idle, ~0.05% on a 5 Mbps stream, ~0.25% on 25 Mbps 4K — below the noise floor on M2 Air.
 8. ✅ Alias expansion in `BlocklistState.domainAliases` — see §3 "Alias expansion." Profile entries `youtube.com` and `instagram.com` expand to their full service-domain set so the user enters one canonical SLD per service and the Mac filter handles per-service coverage. Conservative inclusion criteria; `ggpht.com` / `googleapis.com` / `fbcdn.net` deliberately excluded (over-block adjacent services).
 
-**Pending (Phase F: distribution)**:
-- TestFlight for iPhone (Foqos fork) — friend installs via TestFlight invite, no paid Dev account on their side. Builds expire after 90 days; you re-upload periodically.
-- Developer ID + notarize for Mac — switch Release signing from Apple Development → Developer ID Application; switch NE entitlement from `content-filter-provider` → `content-filter-provider-systemextension` for Release builds; build → `xcrun notarytool submit --wait` → `xcrun stapler staple` → ship .dmg.
-- Self-deploy script `scripts/deploy-mac.sh` — wraps `xcodebuild` + `ditto /Applications` + relaunch.
-- Parameterized share recipe — extend `apply-mybrick-overrides.sh` to take `TEAM_ID` + `BUNDLE_PREFIX` so a friend with their own paid Dev account could fork-and-build (alternative path to TestFlight).
-- Documentation: §18 "Distribution & sharing."
+**Phase F: distribution** (mixed status):
+- ✅ Self-deploy script `scripts/deploy-mac.sh` — wraps `xcodebuild` + `ditto /Applications` + relaunch with auto pbxproj-version bump and revert. Documented in §16.
+- ✅ Distribution documentation — see §18. Covers TestFlight setup steps (one-time + per-build), Developer ID notarization commands (one-time + per-build), friend onboarding, update cadence, per-friend cost.
+- ⏳ Actual TestFlight upload — manual user action (Archive in Xcode → Upload to App Store Connect → invite by email). Walked through in §18.B.
+- ⏳ Actual Mac notarization — manual user action (entitlement switch for Release config + `xcrun notarytool submit` + `xcrun stapler staple` + DMG packaging). Walked through in §18.C.
+- ⏳ (Optional, deferred) Parameterized share recipe — would extend `apply-mybrick-overrides.sh` to take `TEAM_ID` + `BUNDLE_PREFIX` so a friend with their *own* paid Dev account could fork-and-build instead of accepting a TestFlight build. Not built yet because the stated use case is the no-Dev-account friend path; ~50 LOC if ever needed.
 
 ### Cross-cutting learnings (preserve for future sessions)
 
@@ -825,10 +825,15 @@ Categories worth grepping:
 
 All under `scripts/`. Run from the user's terminal (Claude's sandbox blocks xcodebuild, log show, /Applications writes).
 
-### `scripts/dev-iterate.sh`
-One-shot dev iteration loop. Bumps `CURRENT_PROJECT_VERSION`, builds via xcodebuild, copies fresh `.app` to `/Applications`, kills old processes, launches, then `exec /usr/bin/log stream` to tail extension logs (Ctrl-C to exit). Reverts pbxproj at end so working tree stays clean.
+### `scripts/deploy-mac.sh`
+Self-deploy: build FoqosMac (Debug), copy to `/Applications`, kill old processes, launch. Bumps `CURRENT_PROJECT_VERSION` to `date +%s` so sysextd takes the `.replace` path. Reverts pbxproj at end so working tree stays clean. Build output to `scripts/.deploy-mac.log` (gitignored).
 
-Use when: making code changes during active dev, want to see live logs while testing.
+Use when: you've made code changes and want them on `/Applications/FoqosMac.app` without running the full `c5-verify.sh` assertion suite. Faster than verify (no curl/log assertions; just build + ditto + open).
+
+### `scripts/dev-iterate.sh`
+Older variant of `deploy-mac.sh` that also `exec`s `log stream` at the end so logs tail until Ctrl-C. Largely superseded by `deploy-mac.sh` + a separate terminal running `log stream`. Kept around as historical reference; still works.
+
+Use when: you specifically want the build-and-tail pattern in one terminal.
 
 ### `scripts/c5-verify.sh`
 End-to-end verification with bump→build→deploy→XPC-handshake-check→curl-tests→capture-logs→verdict. Bumps `CURRENT_PROJECT_VERSION` to `date +%s` (always unique, forces OS replace). Reverts pbxproj at end so working tree stays clean. Asserts:
@@ -881,6 +886,7 @@ STEP 1: read CLAUDE.md in full. SSOT. Most important sections:
   - §11 cross-cutting learnings — failure modes already discovered
   - §14 (reference architectures — Apple DTS forum threads to consult)
   - §16 (dev workflow scripts)
+  - §18 (distribution & sharing — TestFlight + notarize flow)
 
 STEP 2: confirm state via git log.
   cd ~/projects/FoqosUp && git log --oneline -25
@@ -965,5 +971,141 @@ OPERATIONAL RULES:
 
 ---
 
+## 18. Distribution & sharing (Phase F)
+
+**Use case**: ship the brick experience to a friend who does NOT have their own paid Apple Developer account. The friend installs Foqos on their iPhone (via TestFlight) and FoqosMac on their Mac (via your-team-signed, notarized .dmg). Both binaries are signed by your team — your `$99/yr` is the only Apple subscription involved. The friend signs into iCloud with their own Apple ID; per-friend state is naturally isolated within the team-prefixed iCloud KV namespace.
+
+Friends do NOT need: a Developer Program subscription, your team membership, App Store Connect access. They DO need: an iPhone running iOS 18+, a Mac running macOS 26+, an Apple ID, and a cheap NTAG NFC tag (~$5 on Amazon).
+
+### A. Self-deploy (your dev cycle)
+
+```bash
+bash ~/projects/FoqosUp/scripts/deploy-mac.sh
+```
+
+Builds FoqosMac (Debug), copies to `/Applications`, kills + relaunches. Bumps `CURRENT_PROJECT_VERSION` so sysextd takes the `.replace` path; reverts the pbxproj at end so the working tree stays clean. For iOS, just `open ~/projects/FoqosUp/Foqos/foqos.xcodeproj` and Cmd+R with your iPhone tethered.
+
+### B. iPhone (Foqos fork) → friend via TestFlight
+
+**One-time setup at App Store Connect** (do this once per major Foqos fork or whenever the bundle ID changes):
+
+1. Visit App Store Connect → My Apps → ➕ → New App. Bundle ID = `com.usetessera.mybrick` (or whatever your iOS Foqos pbxproj currently has). SKU = anything (e.g. `mybrick-1`). Primary language = English.
+2. Fill in only the bare minimum: Name, Privacy Policy URL (TestFlight requires it; a static page on your domain or a Notion link works). Skip screenshots for TestFlight-only.
+
+**Per-build steps**:
+
+1. Open `~/projects/FoqosUp/Foqos/foqos.xcodeproj` in Xcode.
+2. Select "Any iOS Device (arm64)" as the destination, then `Product → Archive`.
+3. When the Organizer opens: select archive → Distribute App → App Store Connect → Upload → next-next-finish.
+4. Wait ~5-15 minutes for processing. Push notification arrives when ready.
+5. App Store Connect → My Apps → MyBrick → TestFlight tab → confirm new build is listed and "Ready to Test."
+6. **Internal Testing** (fastest, no Apple review, up to 100 testers): add tester by Apple ID email under Internal Testing group → save → invite is sent automatically.
+7. **External Testing** (up to 10,000 testers, requires a one-time Apple review of the first build, ~24-48 hours): same flow under External Testing group.
+
+**Friend's onboarding**:
+
+1. Friend opens the email invite on their iPhone → taps "View in TestFlight" (TestFlight app installs from the App Store if not present).
+2. TestFlight shows "MyBrick" → Install.
+3. Friend launches MyBrick → first-run wizard → connect NFC tag → configure profile → done.
+
+**Caveats**:
+
+- TestFlight builds expire **after 90 days**. You re-archive + re-upload every ~80 days; existing testers get an in-app notification to update.
+- The bundle ID in `foqos.xcodeproj` must match what's registered on App Store Connect, otherwise upload fails.
+
+### C. Mac (FoqosMac) → friend via Developer ID + notarization
+
+**One-time entitlement switch** (Release configuration only, leave Debug as `content-filter-provider` for daily dev):
+
+In `FoqosMac.entitlements` and `FoqosMacFilter.entitlements` for the Release build configuration, change:
+```xml
+<key>com.apple.developer.networking.networkextension</key>
+<array>
+  <string>content-filter-provider-systemextension</string>
+</array>
+```
+The `-systemextension` suffix requires Developer ID signing — fails to provision on Apple Development cert. This is why we keep two configurations.
+
+**One-time notarization credential** (stores Apple ID + app-specific password in keychain):
+
+```bash
+xcrun notarytool store-credentials FoqosNotary --apple-id <your-apple-id> --team-id 5K5YSF2TWZ
+```
+
+When prompted, paste an app-specific password generated at appleid.apple.com → "App-Specific Passwords."
+
+**Per-build steps**:
+
+```bash
+cd ~/projects/FoqosUp/FoqosMac
+
+# Archive Release (Developer ID signed)
+xcodebuild -project FoqosMac.xcodeproj -scheme FoqosMac \
+  -configuration Release \
+  -archivePath /tmp/FoqosMac.xcarchive archive \
+  CODE_SIGN_STYLE=Manual \
+  DEVELOPMENT_TEAM=5K5YSF2TWZ \
+  CODE_SIGN_IDENTITY="Developer ID Application"
+
+# Export the .app from the archive
+cat > /tmp/exportOptions.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>method</key><string>developer-id</string>
+  <key>teamID</key><string>5K5YSF2TWZ</string>
+</dict>
+</plist>
+EOF
+xcodebuild -exportArchive \
+  -archivePath /tmp/FoqosMac.xcarchive \
+  -exportPath /tmp/FoqosMac-export \
+  -exportOptionsPlist /tmp/exportOptions.plist
+
+# Notarize (uploads, waits, returns Accepted/Invalid)
+xcrun notarytool submit /tmp/FoqosMac-export/FoqosMac.app \
+  --keychain-profile FoqosNotary --wait
+
+# Staple the notarization ticket so Gatekeeper trusts it offline
+xcrun stapler staple /tmp/FoqosMac-export/FoqosMac.app
+
+# Package as DMG
+hdiutil create -volname "FoqosMac" \
+  -srcfolder /tmp/FoqosMac-export/FoqosMac.app \
+  -ov -format UDZO /tmp/FoqosMac.dmg
+```
+
+The resulting `/tmp/FoqosMac.dmg` is what you ship.
+
+**Friend's onboarding**:
+
+1. Download `FoqosMac.dmg`, open it, drag `FoqosMac.app` to /Applications.
+2. First launch: macOS shows "FoqosMac is from an identified developer" → Open.
+3. App auto-submits `OSSystemExtensionRequest`. macOS posts "System Extension Blocked" notification.
+4. System Settings → Privacy & Security → unlock → click Allow next to FoqosMacFilter.
+5. Network filter prompt → Allow.
+6. Friend already signed into their iCloud; FoqosMac's menu bar dropdown reflects whatever state their iPhone has bricked.
+
+### D. Updating shipped builds
+
+- **iOS**: re-Archive + re-Upload to App Store Connect → Internal/External testers get update prompts within hours.
+- **Mac**: re-build + re-notarize + share new .dmg URL. There's no in-app updater (would need Sparkle; out of scope at this distribution scale).
+
+### E. Per-friend cost
+
+| Cost | Who pays |
+|---|---|
+| Apple Developer Program ($99/yr) | You — already paid |
+| TestFlight access | Free, Apple-side |
+| NFC tag (~$5) | Friend |
+| Friend's Apple ID | Free |
+
+### F. Why we did NOT build a parameterized share recipe
+
+The original Phase F plan included a parameterized version of `scripts/apply-mybrick-overrides.sh` that takes `TEAM_ID` + `BUNDLE_PREFIX` as env vars, so a friend with their *own* paid Dev account could fork-and-build instead of accepting your TestFlight build. **Deferred**: TestFlight + notarized .dmg covers the actual stated use case ("friend doesn't have a paid Dev account") with zero per-friend complexity. If a future friend turns out to have their own team and would rather sign locally, the recipe is ~50 LOC of `sed` substitutions across `Foqos/foqos.xcodeproj/project.pbxproj`, the four iOS entitlements files, and `FoqosMac/FoqosMac/FoqosMac.entitlements` + `FoqosMac/FoqosMacFilter/FoqosMacFilter.entitlements`. Add it then.
+
+---
+
 **Last fork sync**: Foqos 1.32.4 (commit `5ac998f`, 2026)
-**Document version**: 2026-05-01 — Phases A through E all complete (login-at-startup, AppIcon, dropdown UX, emergency PIN, filter state-transition reactivity, service-domain alias expansion). c5-verify.sh 6/6 baseline + 7/7 with real iPhone state. Phase F (distribution: TestFlight + notarize + deploy script + parameterized share recipe) is the only remaining major work item.
+**Document version**: 2026-05-01 — Phases A through E all complete + Phase F docs/scripts in place. Login-at-startup, AppIcon, dropdown UX, emergency PIN, filter state-transition reactivity, service-domain alias expansion, self-deploy script, full distribution flow documentation. c5-verify.sh 6/6 baseline + 7/7 with real iPhone state. Remaining: actual TestFlight upload + Mac notarization (both walked through in §18, both manual user actions in App Store Connect / Apple Developer portal).
