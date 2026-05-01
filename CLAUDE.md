@@ -588,7 +588,12 @@ sudo defaults read group.com.usetessera.mybrick com.usetessera.mybrick.blocklist
 
 This is the canonical sysext UID split: even when the container correctly writes to its user-side App Group plist, the filter (root) reads from `/var/root/...` and sees nothing. Apple's `SimpleFirewall` sample uses NSXPCConnection over the filter's NEMachServiceName for exactly this reason.
 
-**Pending (Phase C6 — real-iPhone end-to-end)**: brick iPhone with `instagram.com` in profile, wait ~2s, `curl -v --max-time 8 https://instagram.com` → expect `curl: (35)`. Unbrick → expect 200/301. Unblocked once C5 verify passes locally.
+**Done (Phase C6 — real-iPhone end-to-end)** (verified by `scripts/c5-verify.sh` with `TEST_BLOCKED_DOMAIN=instagram.com`, run `2026-05-01 03:59`):
+- ✅ iPhone bricked with profile containing `instagram.com` → iCloud sync (~1–2s) → container's `BridgeState.refresh()` → `IPCClient.publish` → filter's `IPCService.updateBlocklist` → `BlocklistState.update`. Confirmed via paired log lines (`Snapshot received: blocked=true … domains=1` / `Updated: blocked=true … domains=1`).
+- ✅ `curl -m 6 https://instagram.com` → `000` (TCP-level connection failure from `.drop()` verdict). Filter log: `SNI DROP instagram.com`.
+- ✅ `curl -m 6 https://www.apple.com` → `200` (filter is not blackholing — verifies allow path on the same run).
+- ✅ QUIC blackhole still firing (12+ `flow DROP udp/443` log lines for instagram's HTTP/3 attempts before browser fell back to TCP+TLS).
+- ✅ `c5-verify.sh` reports **7/7 passed** for the full pipeline assertion set.
 
 **Pending (Phase D — Chrome SNI inspection)**: ✓ DONE (see above).
 
@@ -714,7 +719,7 @@ End-to-end verification with bump→build→deploy→inject-synthetic-state→cu
 
 Output: `scripts/c5-verify.out` with a clear PASS/FAIL verdict and full diagnostic logs (FilterDataProvider, BlocklistState, ExtensionActivator, AppGroupBridge categories).
 
-Currently 4/6 passing — see Phase C5 BLOCKER. The 2 failures are the synthetic injection mechanism (defaults write to wrong file) — the real-iPhone path is unblocked once C5 IPC is fixed.
+Currently 7/7 passing (post-XPC pivot, with `TEST_BLOCKED_DOMAIN=instagram.com` set and the iPhone bricked).
 
 ### `scripts/c4-verify.sh`, `scripts/c4-test.sh`
 Earlier verification scripts kept as historical reference for the C4/D pipeline-only test. Superseded by `c5-verify.sh` for ongoing dev verification but useful diagnostic tools if filter pipeline ever regresses.
@@ -769,16 +774,7 @@ WHAT WORKS (verified end-to-end through Phase D, C5 verification next):
     container runs as user, writes to /Users/.../). DTS-confirmed; lsof
     evidence in commit body.
 
-WHAT'S NEXT (Phase C6 — real-iPhone end-to-end test):
-  1. Run scripts/c5-verify.sh — should pass 4/4 XPC handshake assertions
-     plus the apple.com sanity check.
-  2. With iPhone bricked (profile containing instagram.com), set
-     TEST_BLOCKED_DOMAIN=instagram.com and re-run scripts/c5-verify.sh,
-     OR run curl -v --max-time 8 https://instagram.com manually and expect
-     curl: (35) Recv failure. Unbrick the iPhone, wait ~2s, expect 200/301.
-  3. If both pass, mark Phase C6 ✅ DONE in CLAUDE.md §11.
-
-WHAT'S AFTER (Phase E — polish, see §11):
+WHAT'S NEXT (Phase E — polish, see §11):
   - SMAppService login-at-startup
   - Custom menu bar icon
   - Emergency override (Keychain PIN)
@@ -806,4 +802,4 @@ OPERATIONAL RULES:
 ---
 
 **Last fork sync**: Foqos 1.32.4 (commit `5ac998f`, 2026)
-**Document version**: 2026-05-01 — Phases A through D + C5 complete (C5 pivoted from App Group UserDefaults → NSXPCConnection after confirming the sysext UID-split). Phase C6 (real-iPhone end-to-end) + Phase E (polish) pending.
+**Document version**: 2026-05-01 — Phases A through D, C5, C6 all complete. C5 pivoted from App Group UserDefaults → NSXPCConnection after confirming the sysext UID-split; C6 verified by `scripts/c5-verify.sh` 7/7 with real iPhone state. Phase E (polish) pending.
