@@ -174,8 +174,10 @@ final class FilterDataProvider: NEFilterDataProvider {
     // unbrick + rebrick), pause toggle, etc. Apple's NEFilterDataProvider
     // has no retroactive kill API for `.allow()`d flows; ongoing inspection
     // is the only mechanism that actually works. The cost is bounded by
-    // active flow throughput — per CLAUDE.md §16's perf notes, ~0.1% CPU
-    // on a 5 Mbps stream with peekBytes=64 KB. Idle flows are free.
+    // active flow throughput — `peekBytes = Int.max` lets the system
+    // deliver in natural-sized chunks (typically per TCP segment, ~1-1.5
+    // KB), so idle flows fire zero callbacks. See `watchChunk` for full
+    // rationale.
     rememberFlow(flowID, sni: sni)
     log.info("SNI watch \(sni, privacy: .public)")
     return NEFilterDataVerdict(passBytes: readBytes.count, peekBytes: Self.watchChunk)

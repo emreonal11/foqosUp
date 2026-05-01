@@ -62,12 +62,22 @@ This file is the SSOT for understanding this entire project. Read it cold and yo
 NFC scan on iPhone
   → Foqos starts session (Screen Time API blocks apps locally)
   → Hooks in SharedData setters write to NSUbiquitousKeyValueStore
-  → iCloud syncs to Mac (~10–20s)
-  → FoqosMac container app observes the change
-  → Mirrors state to App Group UserDefaults
-  → Posts Darwin notification
-  → System Extension reads new state
-  → On each new TCP/UDP flow, decides allow vs drop
+  → iCloud syncs to Mac (~1–2 s typical, occasionally up to 20 s)
+  → FoqosMac container app's ICloudObserver fires
+  → BridgeState.refresh() reads the iCloud snapshot
+  → IPCClient.publish(...) sends JSON-encoded BlocklistSnapshot over
+    NSXPCConnection to the filter sysext
+  → FoqosMacFilter's IPCService receives → BlocklistState.update(...)
+  → BlocklistState alias-expands the user's profile domains (e.g.
+    youtube.com → {youtube.com, googlevideo.com, ytimg.com, youtu.be,
+    youtube-nocookie.com}) and caches the effective set
+  → For each new TCP flow, FilterDataProvider.handleNewFlow peeks 4 KB
+    outbound; handleOutboundData extracts SNI and either drops, allows,
+    or keeps the flow under continuing inspection (peekBytes=Int.max)
+  → On state transitions (break end, rebrick, blocklist mutation), the
+    next outbound chunk on a watched flow triggers a retroactive drop —
+    existing TCP connections to newly-blocked domains die without
+    requiring browser tab close+reopen
 ```
 
 ### Why NEFilterDataProvider over alternatives
@@ -83,26 +93,58 @@ NFC scan on iPhone
 | Configuration profile (webcontent-filter) | Only works in Safari (Chrome ignores). User uses Chrome. |
 | Endpoint Security framework | Entitlement gated to security vendors; not available to solo dev. |
 
-### The Chrome problem (decisive)
+### The hostname problem (Tahoe-wide, not Chrome-specific)
 
-`NEFilterDataProvider.flow.remoteEndpoint.hostname` returns:
-- The **hostname** for Safari, Firefox, and apps using NSURLSession / Network.framework
-- Only the **IP address** for Chrome, Edge, Brave, Arc, Opera (Chromium-based browsers do their own DNS, often DoH, then connect by IP)
+Original assumption: `NEFilterDataProvider.flow.remoteEndpoint.hostname` returns hostnames for Safari/Firefox/NSURLSession and IPs only for Chrome. **This was wrong on macOS Tahoe 26.3.** Verified empirically (Phase D): every TCP flow surfaces as `.ipv4` or `.ipv6`, never `.name`, regardless of client. The kernel resolves DNS before flows reach the filter. The `.name` case in `handleNewFlow` essentially never fires.
 
-User is Chrome-only. So we cannot rely on `flow.remoteEndpoint.hostname` for the primary path.
+**Solution: SNI inspection from `handleOutboundData`.** When `handleNewFlow` sees an IP-only flow, return `.filterDataVerdict(peekOutboundBytes: 4096)`. The system then peeks the first 4 KB of outbound data and delivers them to `handleOutboundData`. We parse the TLS ClientHello to extract the SNI extension (RFC 6066 §3) and match against the alias-expanded blocklist. SNI is plaintext until ECH widely deploys; major distractor sites (Instagram, YouTube, X, Reddit, TikTok) had ~zero ECH adoption as of 2026.
 
-**Solution**: SNI inspection. When `handleNewFlow` is called with an IP-only flow, return `.filterDataVerdict(peekOutboundBytes: 1024)`. The system then calls `handleOutboundDataFromFlow` with the first 1KB of outbound data. Parse the TLS ClientHello to extract the SNI extension (which carries the destination hostname in plaintext for non-ECH connections). Match against blocklist.
+QUIC complication: HTTP/3 carries the TLS handshake inside encrypted CRYPTO frames, so SNI inspection from outbound data doesn't work. Rather than parse QUIC, we drop **all UDP/443 flows** at `handleNewFlow` (the "QUIC blackhole"). Browsers fall back to TCP+TLS automatically — slight latency hit, full SNI visibility.
 
-ECH (Encrypted Client Hello) defeats SNI inspection but is multi-year horizon. Cloudflare-fronted sites have it; Instagram/YouTube/X/TikTok/Reddit do not as of 2026.
+### Container ↔ Extension IPC: NSXPCConnection
 
-### Container ↔ Extension IPC
+The intuitive design — App Group `UserDefaults(suiteName:)` plus a Darwin notification — **does not work** for sysext↔container IPC on macOS. NEFilterDataProvider sysexts run as **root** under their own per-root sandbox container; the container app runs as the logged-in user. `UserDefaults(suiteName:)` resolves to physically separate plists under `/var/root/Library/Group Containers/...` vs `/Users/<u>/Library/Group Containers/...`. Each side reads/writes its own file; they never see each other's bytes. Verified empirically in Phase C5 with `scripts/c5-lsof-check.sh`. Apple DTS (Quinn the Eskimo, threads 133543 + 763433) explicitly confirms this and recommends NSXPCConnection.
 
-Standard Apple pattern:
-- Container app writes state to `UserDefaults(suiteName: "group.com.usetessera.mybrick")`
-- Container posts a Darwin notification: `CFNotificationCenterPostNotification` with name `"com.usetessera.mybrick.state.changed"`
-- Extension observes the notification, re-reads UserDefaults, updates internal blocklist
+What's actually used:
+- Filter sysext (`IPCService.swift`): `NSXPCListener` bound to the filter's `NEMachServiceName` from Info.plist (`group.com.usetessera.mybrick.FoqosMacFilter`). NetworkExtension's internal sysextd↔filter channel is kernel-private and disjoint from app-level XPC, so the same Mach name doesn't collide.
+- Container app (`IPCClient.swift`): persistent `NSXPCConnection` to that Mach service. Retry-with-backoff on the first publish (handles the dev-iteration race where the container connects to a dying old extension during sysext replacement).
+- Wire format: JSON-encoded `BlocklistSnapshot` (the same Codable struct on both sides). Sent as a single `Data` argument in `updateBlocklist(_:withReply:)`.
+- Reference: Apple's `SimpleFirewall` sample uses this exact pattern.
 
-No XPC service needed.
+The App Group entitlement is **still required** — `NEMachServiceName` must be prefixed with one of the App Groups in `com.apple.security.application-groups` (sysextd's category-specific validator rejects mismatches with `NetworkExtensionErrorDomain Code=6`). We just no longer use the App Group for actual data sharing.
+
+### Filter behavior on state transitions: watch every TLS flow
+
+`NEFilterDataProvider` provides no API to retroactively drop a flow once `.allow()` has been returned. Verified via Apple's headers and DTS (forum thread 735504: *"once I return an allow/deny verdict for the flow … do I no longer see that flow's traffic in my content filter? — Correct."*). `applySettings`, `handleRulesChanged`, `notifyRulesChanged`, `applyNewFilterRules`, `resumeFlow` — all only affect new or paused flows, never `.allow()`d ones.
+
+Consequence: if we `.allow()` a flow during normal browsing and the user later starts a focus session, the existing TCP connection (and any HTTP/2-multiplexed requests on it) bypass the filter forever. Browsers like Chrome aggressively reuse persistent connections for new tabs, so "I just bricked but YouTube keeps working" is the default experience without intervention.
+
+**Fix**: never return `.allow()` from `handleOutboundData` for TLS flows after SNI extraction. Instead, return `NEFilterDataVerdict(passBytes: readBytes.count, peekBytes: Int.max)`. The system delivers in natural-sized chunks (typically per TCP segment, ~1-1.5 KB) rather than buffering up to a fixed threshold. Each subsequent chunk re-checks `BlocklistState.shouldBlock(host: cachedSNI)` against current state; transitions to "should now block" produce an immediate `.drop()` on the next byte of outbound activity. Idle flows fire zero callbacks (the system only invokes us when bytes actually move) — cost scales with throughput, not with elapsed time.
+
+Per-flow SNI is cached in `watchedSNI: [UUID: String]` (NEFilterFlow's UUID is per-flow stable). Lifetime is "TLS flows seen since filter started" because the kernel doesn't notify on flow end. Bounded by total file descriptors; ~5-10 K entries × 40 bytes/entry = ~400 KB on a heavy 24-hour day. Negligible. Diagnostic milestone log (1 K / 5 K / 10 K / 50 K / 100 K) surfaces pathological growth in `log show`.
+
+Why `Int.max` and not a fixed value: HTTP/2 control traffic produces small bursts (~1 KB headers per request). With `peekBytes = 64 KB`, dozens of clicks worth of activity could accumulate before the kernel flushes the buffer to us — state-change reaction was effectively never. `Int.max` makes Apple's framework deliver per-TCP-segment, so user-perceived reaction is bounded by user activity.
+
+Cost on M2 Air: 0% idle, ~0.05% on a 5 Mbps stream, ~0.25% on 25 Mbps 4K, ~1% on 10 parallel heavy streams. Below the noise floor of any OS-exposed instrument.
+
+### Alias expansion: profile-level intent → comprehensive domain coverage
+
+A blocklist entry of `youtube.com` only suffix-matches `*.youtube.com`. It does NOT match `googlevideo.com` (where YouTube actually streams its videos), `ytimg.com` (thumbnails), `youtu.be` (short links), or `youtube-nocookie.com` (embeds). With only `youtube.com` blocked, YouTube tabs and Shorts kept playing video chunks via googlevideo.com — the page HTML was already in DOM and SPA navigation didn't trigger new www.youtube.com requests.
+
+The fix lives in `BlocklistState.domainAliases` — a static map from "high-level service domain" to "all the SLDs that service depends on." When `BlocklistState.update(_:)` swaps in a new snapshot, we expand the user's profile entries through this map and cache the result. `shouldBlock` then suffix-matches against the expanded set.
+
+Current aliases:
+- `youtube.com` → `{youtube.com, googlevideo.com, ytimg.com, youtu.be, youtube-nocookie.com}`
+- `instagram.com` → `{instagram.com, cdninstagram.com}`
+
+Conservative inclusion: a domain joins an alias only if it's exclusively (or near-exclusively) used by the named service. Deliberately excluded:
+- `ggpht.com` (used by Gmail avatars + Google Photos profile pics — over-blocks).
+- `googleapis.com` (every Google service — over-blocks).
+- `fbcdn.net` (shared across Instagram + Facebook + Messenger + WhatsApp — user can opt in by adding to their iOS profile manually if they want broader Meta coverage).
+
+Keeps the iOS profile under Foqos's 50-entry limit and preserves the user's "block YouTube" mental model. Asymmetry with iOS Safari (which doesn't see this map) is documented but benign — iOS Foqos primarily blocks at the app layer via ManagedSettings / ApplicationToken; domains are mostly a Mac-side concern.
+
+To extend: add a new mapping to `BlocklistState.domainAliases` and ship. No iOS-profile rebuild needed; the Mac filter alone owns the table.
 
 ### iOS as SSOT, Mac as read-only observer
 
@@ -134,15 +176,24 @@ The `$(TeamIdentifierPrefix)` form (NOT `$(CFBundleIdentifier)`) is required for
 
 ### Mac block decision
 
+The filter's `BlocklistState.shouldBlock(host:)` runs against the alias-expanded effective domain set (see §3 "Alias expansion"):
+
 ```swift
-shouldBlock(host: String) -> Bool {
-    guard isBlocked, !isBreakActive, !isPauseActive else { return false }
+func shouldBlock(host: String) -> Bool {
+    guard snap.isBlocked, !snap.isBreakActive, !snap.isPauseActive else { return false }
     let h = host.lowercased()
-    return domains.contains { h == $0 || h.hasSuffix(".\($0)") }
+    for entry in effectiveDomains where !entry.isEmpty {
+        if h == entry || h.hasSuffix(".\(entry)") { return true }
+    }
+    return false
 }
 ```
 
-Suffix match means blocking `youtube.com` also blocks `m.youtube.com`, `studio.youtube.com`, etc.
+`effectiveDomains` is a `Set<String>` recomputed once per state update by expanding the user's profile entries through `BlocklistState.domainAliases`. Suffix match means `youtube.com` covers `m.youtube.com`, `studio.youtube.com`, etc. — and via the alias, also `*.googlevideo.com`, `*.ytimg.com`, `youtu.be`, `*.youtube-nocookie.com`.
+
+Called from two places:
+- `FilterDataProvider.handleNewFlow` for the rare `.name` flow path (almost never fires on Tahoe — see §3 "hostname problem").
+- `FilterDataProvider.handleOutboundData` for the SNI path, which is the actual blocking mechanism. Called once at first inspection and on every subsequent chunk of any watched flow (see §3 "Filter behavior on state transitions").
 
 ### Pause vs break (resolved)
 
@@ -214,125 +265,162 @@ The bridge code is **inlined into `Shared.swift`** as a private helper, not a se
 
 ## 6. macOS Mac app — architecture
 
-### Targets (planned final layout)
+### Targets (current layout, post-Phase E)
 
 ```
 FoqosMac.xcodeproj/
-├── FoqosMac/                  ← container app (SwiftUI MenuBarExtra)
-│   ├── FoqosMacApp.swift      ← @main, MenuBarExtra (DONE, Phase B)
-│   ├── ContentView.swift      ← state-display dropdown UI (DONE, Phase B)
-│   ├── BridgeState.swift      ← ObservableObject (TODO Phase C: split out of FoqosMacApp.swift)
-│   ├── ICloudObserver.swift   ← NSUbiquitousKeyValueStore listener (TODO Phase C: split out)
-│   ├── ExtensionActivator.swift  ← OSSystemExtensionRequest flow (TODO Phase C)
-│   ├── AppGroupBridge.swift   ← writes state to App Group, posts Darwin notification (TODO Phase C)
-│   ├── EmergencyOverride.swift   ← PIN UI + Keychain storage (TODO Phase E)
-│   └── FoqosMac.entitlements  ← KV + App Group (DONE Phase B); add NE + SE for Phase C
-└── FoqosMacFilter/            ← System Extension (TODO Phase C — entire target doesn't exist yet)
-    ├── FilterDataProvider.swift   ← NEFilterDataProvider subclass
-    ├── FilterControlProvider.swift ← NEFilterControlProvider stub
-    ├── SNIParser.swift            ← TLS ClientHello SNI extraction (Phase D)
-    ├── BlocklistMatcher.swift     ← exact + suffix matching
+├── FoqosMac/                                ← container app (SwiftUI MenuBarExtra, LSUIElement=YES)
+│   ├── FoqosMacApp.swift                    ← @main; calls LoginItem.ensureRegistered() in init
+│   ├── ContentView.swift                    ← dropdown UI (mode state machine: .main / .settingPIN / .enteringPIN)
+│   ├── BridgeState.swift                    ← @MainActor ObservableObject; reads iCloud, owns emergency-override logic
+│   ├── BridgeKey.swift                      ← iCloud KV key constants
+│   ├── ICloudObserver.swift                 ← NSUbiquitousKeyValueStore listener
+│   ├── ExtensionActivator.swift             ← OSSystemExtensionRequest flow + NEFilterManager config
+│   ├── BlocklistService.swift               ← @objc(FoqosBlocklistService) protocol — XPC interface
+│   ├── IPCClient.swift                      ← NSXPCConnection client + retry-with-backoff
+│   ├── LoginItem.swift                      ← SMAppService.mainApp.register() wrapper
+│   ├── EmergencyOverride.swift              ← Keychain wrapper for local 4-digit PIN
+│   ├── Assets.xcassets/                     ← AppIcon (Foqos's iOS marketing icon, resized)
+│   └── FoqosMac.entitlements                ← KV + App Group + NE content-filter + sysext install
+└── FoqosMacFilter/                          ← System Extension (sysext)
+    ├── main.swift                           ← NEProvider.startSystemExtensionMode() + dispatchMain()
+    ├── FilterDataProvider.swift             ← NEFilterDataProvider subclass, watch-all-flows logic
+    ├── BlocklistState.swift                 ← in-memory state cache + alias expansion + shouldBlock
+    ├── BlocklistService.swift               ← @objc(FoqosBlocklistService) protocol — identical to container's
+    ├── IPCService.swift                     ← NSXPCListener bound to NEMachServiceName
+    ├── SNIParser.swift                      ← TLS ClientHello SNI extraction (RFC 6066 §3)
+    ├── Info.plist                           ← NEMachServiceName + NEProviderClasses
     └── FoqosMacFilter.entitlements
 ```
 
-**Current reality (post-Phase B)**: `BridgeState` + `ICloudObserver` + `BridgeKey` are all inlined in `FoqosMacApp.swift`. The Phase B build was done before we realized the project uses synchronized file groups — see next note. Splitting them is a Phase C cleanup that also clears the SourceKit "main attribute / top-level code" lint warning.
+Notes:
+- The original Phase B layout had `BridgeState` / `ICloudObserver` inlined in `FoqosMacApp.swift`. Phase C0 (commit 7863e20) split them into separate files once we discovered synchronized file groups (see §6 "Synchronized file groups" below) make this trivial.
+- `AppGroupBridge.swift` is gone — deleted in the Phase C5 XPC pivot.
+- `BlocklistService.swift` is a duplicated `@objc protocol` in both targets (one declaration per target). The explicit `@objc(FoqosBlocklistService)` runtime name keeps the Objective-C metadata identical across the two binaries so `NSXPCInterface(with:)` introspects matching protocols on each end.
 
 **Synchronized file groups (`PBXFileSystemSynchronizedRootGroup`)**: `FoqosMac.xcodeproj` was created with Xcode 26.x and uses `objectVersion = 77`, which gives each target a synchronized root group. Any Swift file dropped into the target's source directory (e.g. `FoqosMac/FoqosMac/`) is auto-included in the build — **no `project.pbxproj` edit required**. This applies to the container target today and (when Xcode keeps the same default for new targets) will apply to `FoqosMacFilter` once it's added. Adding a new *target* still requires Xcode's GUI; adding new *files* inside an existing target does not. This contrasts with the iOS Foqos project (§5), which uses the traditional file-reference pattern — that's why the iOS bridge was inlined into `Shared.swift`.
 
-### Container app entitlements
+### Container app entitlements (current)
 
-Phase B (done):
 - `com.apple.developer.ubiquity-kvstore-identifier` = `$(TeamIdentifierPrefix)com.usetessera.mybrick` (same as iOS — **must NOT default to `$(CFBundleIdentifier)`**, that creates a per-bundle namespace which iOS can't reach)
 - `com.apple.security.app-sandbox` = `true`
 - `com.apple.security.application-groups` = `[group.com.usetessera.mybrick]`
-
-Phase C (to add):
-- `com.apple.developer.networking.networkextension` = `[content-filter-provider-systemextension]`
+- `com.apple.developer.networking.networkextension` = `[content-filter-provider]` (legacy variant for Apple Development cert; switch to `content-filter-provider-systemextension` only when moving to Developer ID for distribution)
 - `com.apple.developer.system-extension.install` = `true`
 
-### Extension entitlements (Phase C)
+### Extension entitlements (current)
 
+- `com.apple.security.app-sandbox` = `true`
 - `com.apple.security.application-groups` = `[group.com.usetessera.mybrick]`
-- `com.apple.developer.networking.networkextension` = `[content-filter-provider-systemextension]`
+- `com.apple.developer.networking.networkextension` = `[content-filter-provider]` (matches container — must be the legacy variant for dev signing)
 
 ⚠️ **Critical**: when adding the iCloud capability via Xcode's `+ Capability` dialog, the search for "iCloud" returns BOTH `iCloud` and `iCloud Extended Share Access`. Only the first is wanted. The second is a separate macOS Tahoe capability for in-process app sharing — adds noise + can interfere with provisioning. If accidentally added, click the trash icon on its capability row to remove.
 
 ### NEFilterDataProvider behavior on macOS
 
-- System Extension model (NOT app extension) — runs as privileged service after user approval
-- "supervised device only" docs apply to iOS, NOT macOS
-- `handleNewFlow(NEFilterFlow)` returns one of:
-  - `.allow()` — allow flow without further inspection
-  - `.drop()` — block at TCP layer, browser shows "can't connect"
-  - `.filterDataVerdict(withFilterInbound: false, peekInboundBytes: 0, filterOutbound: true, peekOutboundBytes: 1024)` — request to peek at outbound data
+- System Extension model (NOT app extension) — runs as a privileged service (UID 0, root) after user approval, sandboxed under `~root`.
+- "supervised device only" docs apply to iOS, NOT macOS.
+- Per-flow callbacks: `handleNewFlow(_:)` decides initially; `handleOutboundData(from:...)` re-inspects bytes if requested.
+- New-flow verdicts: `.allow()` (detach, irrevocable — no retroactive kill API), `.drop()` (close at TCP layer), `.filterDataVerdict(filterOutbound: true, peekOutboundBytes: N)` (deliver first N bytes to handleOutboundData), `.pause()` (hold flow until `resumeFlow(_:with:)`).
+- Data verdicts: `.allow()` (detach), `.drop()`, `.pauseVerdict()`, `NEFilterDataVerdict(passBytes: P, peekBytes: K)` (release P bytes through, deliver next K to handleOutboundData).
 
-### The two-path matching strategy
+### The current matching pipeline
+
+`FilterDataProvider` runs the full pipeline below for every TCP flow. The `.name` path almost never fires on Tahoe (kernel pre-resolves DNS); SNI inspection from `handleOutboundData` is where actual blocking happens.
 
 ```swift
 override func handleNewFlow(_ flow: NEFilterFlow) -> NEFilterNewFlowVerdict {
     guard let socketFlow = flow as? NEFilterSocketFlow,
-          let endpoint = socketFlow.remoteEndpoint as? NWHostEndpoint
+          let endpoint = socketFlow.remoteFlowEndpoint
     else { return .allow() }
-    
-    let host = endpoint.hostname
-    
-    if isIPAddress(host) {
-        // Path 2: Chrome — peek outbound bytes for SNI inspection
-        return .filterDataVerdict(
-            withFilterInbound: false,
-            peekInboundBytes: 0,
-            filterOutbound: true,
-            peekOutboundBytes: 1024
-        )
+
+    // QUIC blackhole — drop UDP/443 to force HTTP/3 → TCP+TLS fallback
+    if socketFlow.socketProtocol == Int32(IPPROTO_UDP),
+       case .hostPort(_, let port) = endpoint, port.rawValue == 443 {
+        return .drop()
     }
-    
-    // Path 1: Safari/Firefox/NSURLSession — direct hostname match
-    return BlocklistMatcher.shouldBlock(host) ? .drop() : .allow()
+
+    guard case .hostPort(let host, _) = endpoint else { return .allow() }
+
+    switch host {
+    case .name(let name, _):                                         // rare on Tahoe
+        return BlocklistState.shared.shouldBlock(host: name.lowercased()) ? .drop() : .allow()
+    case .ipv4, .ipv6:                                               // ~100 % of real flows
+        return .filterDataVerdict(filterOutbound: true,
+                                  peekOutboundBytes: 4096)           // peek ClientHello
+    @unknown default:
+        return .allow()
+    }
 }
 
-override func handleOutboundData(from flow: NEFilterFlow,
-                                 readBytesStartOffset: Int,
-                                 readBytes: Data) -> NEFilterDataVerdict {
-    if let sni = SNIParser.extractSNI(from: readBytes) {
-        return BlocklistMatcher.shouldBlock(sni) ? .drop() : .allow()
+override func handleOutboundData(...) -> NEFilterDataVerdict {
+    let flowID = flow.identifier
+
+    // Continuing inspection on a previously-watched flow.
+    if let sni = cachedSNI(for: flowID) {
+        if BlocklistState.shared.shouldBlock(host: sni) {
+            forgetFlow(flowID)
+            return .drop()                                            // retroactive kill
+        }
+        return NEFilterDataVerdict(passBytes: readBytes.count,
+                                   peekBytes: Int.max)                // keep inspecting
     }
-    return .allow()  // Couldn't parse — fail open
+
+    // First-time inspection — extract SNI from ClientHello.
+    guard let sni = SNIParser.extractSNI(from: readBytes) else {
+        return .allow()                                               // fail open (TLS resumption / ECH / non-TLS)
+    }
+    if BlocklistState.shared.shouldBlock(host: sni) { return .drop() }
+
+    rememberFlow(flowID, sni: sni)                                    // start watching
+    return NEFilterDataVerdict(passBytes: readBytes.count,
+                               peekBytes: Int.max)
 }
 ```
 
-### Apple Developer portal setup needed
+Why the watch-everything pattern after SNI extraction: see §3 "Filter behavior on state transitions."
 
-1. App ID for `com.usetessera.mybrick.FoqosMac` (container)
-2. App ID for `com.usetessera.mybrick.FoqosMacFilter` (extension)
-3. Network Extensions capability enabled on both
-4. iCloud KV capability enabled on container
-5. App Group `group.com.usetessera.mybrick` shared with both
-6. Provisioning profiles regenerated
+Why `peekBytes = Int.max`: see §3 same section. Apple's documented pattern; system delivers per-TCP-segment, so HTTP/2 control bursts wake us per request rather than buffering.
 
-Most of this is automatic via Xcode's "automatic signing" once entitlements are configured. Some require manual portal clicks (Network Extensions capability sometimes needs an email request to networkextension@apple.com — not always required for solo dev personal apps; try Xcode auto first, only request if denied).
+Why no separate FilterControlProvider: not needed for our use case. FilterControlProvider is for separating slow rule-update logic from the hot data path; we get rule updates via XPC into the data provider directly, and rule changes are rare enough that the data path doesn't need protection.
 
-### First-time install UX
+### Apple Developer portal setup (done; reference for fresh team setup)
 
-1. User downloads/builds .app
-2. Drag to /Applications
-3. First launch: SwiftUI menu bar icon appears
-4. Click menu → "Enable Mac Blocking"
-5. App calls `OSSystemExtensionRequest.activationRequest(...)`
-6. macOS shows "System Extension Blocked" notification
-7. User opens System Settings → Privacy & Security → unlocks → clicks Allow next to FoqosMacFilter
-8. Network filter prompt: "Allow FoqosMac to filter network content?" → Allow
-9. Filter active
+The dev account currently has all of these in place. Reproducing on a fresh team requires:
+1. App ID for `com.usetessera.mybrick.FoqosMac` (container).
+2. App ID for `com.usetessera.mybrick.FoqosMac.FoqosMacFilter` (extension — note the parent-bundle prefix; sysextd requires this hierarchy).
+3. Network Extensions capability enabled on both (auto-granted for personal/team accounts; commercial use may need an email to networkextension@apple.com).
+4. iCloud KV capability enabled on container with identifier `$(TeamIdentifierPrefix)com.usetessera.mybrick`.
+5. App Group `group.com.usetessera.mybrick` shared with both targets.
+6. Provisioning profiles regenerated. Xcode's "automatic signing" handles most of this once entitlements are configured.
 
-### Emergency override
+### First-time install UX (current behavior)
 
-- 4-digit PIN set on first launch
-- Stored in macOS Keychain (not iCloud, not App Group)
-- Disables filter locally without writing to iCloud (so iOS state stays "blocked" even when Mac is unblocked)
-- Re-arms on next iCloud state change OR after timeout (TBD)
+1. User builds locally OR receives a notarized .dmg (Phase F not yet shipped).
+2. Drag `FoqosMac.app` to `/Applications`.
+3. First launch: menu bar icon appears (no Dock icon — `LSUIElement = YES`); `LoginItem.ensureRegistered()` registers for at-login launch on first run.
+4. `BridgeState.init()` immediately submits an `OSSystemExtensionRequest.activationRequest(...)` (no UI button required).
+5. macOS shows "System Extension Blocked" notification.
+6. User opens System Settings → Privacy & Security → unlocks → clicks Allow next to FoqosMacFilter.
+7. Network filter prompt: "Allow FoqosMac to filter network content?" → Allow.
+8. Filter active. Dropdown shows `Filter: active` caption + current iCloud-synced state.
+9. Optional: user opens dropdown → "Set emergency PIN" → enters 4 digits → stored in Keychain for local-only override.
 
-### Login at startup
+### Emergency override (Phase E3, done)
 
-`SMAppService.mainApp.register()` (macOS Ventura+ API). User can manage in System Settings → Login Items. Bundles a LaunchAgent inside the .app for cleanliness.
+- 4-digit PIN set on demand from the dropdown UI (`ContentView.Mode.settingPIN`).
+- Stored in macOS Keychain via `EmergencyOverride.swift` (`kSecClassGenericPassword`, service `com.usetessera.mybrick.emergency`, `kSecAttrAccessibleWhenUnlocked`). Constant-time PIN compare.
+- **Local-only** — never written to iCloud. Engaging the override forces `BridgeState.publishedBlocked = false` in `publishEffectiveState()`, so the filter's `BlocklistState.snapshot.isBlocked` becomes `false` even though the iOS-side iCloud snapshot still says `true`.
+- **Auto-lifts** on the next material iCloud transition (any of `isBlocked` / `isBreakActive` / `isPauseActive` / `domains` / `activeProfileId` differs from the snapshot captured at engage time). User can also manually lift via "End override now" button.
+- **Recovery if PIN forgotten**: `security delete-generic-password -s 'com.usetessera.mybrick.emergency'` from a terminal.
+- Menu bar icon: `lock.slash` (vs `lock.fill` blocked / `lock.open` not blocking) when override is active.
+
+### Login at startup (Phase E1, done)
+
+- `FoqosMac/LoginItem.swift` calls `SMAppService.mainApp.register()` from `FoqosMacApp.init()`.
+- Idempotent — early-outs on `.enabled` (already registered) and on `.requiresApproval` (user disabled it in System Settings; we respect that).
+- User manages the toggle in System Settings → General → Login Items, where it appears as "FoqosMac".
+- Modern API (macOS Ventura+); no LaunchAgent plist or external service needed.
 
 ---
 
@@ -377,18 +465,24 @@ These were independently verified during research; treat as ground truth unless 
 - `ManagedSettings`, `DeviceActivity`, `FamilyControls`, `CoreNFC` — **iOS/iPadOS only**, no macOS equivalent. Verified through WWDC 2025 / macOS Tahoe 26.
 - App selection uses opaque `ApplicationToken`s — can sync state, can't sync the *identity* of selected apps cross-device.
 - Phone app cannot be blocked (Apple policy).
-- 50-app picker limit; use allow-mode for >50.
-- `NSUbiquitousKeyValueStore` sync: 10–20s typical, sometimes minutes; 1MB cap (we use ~5KB).
+- 50-entry profile limit (apps + domains combined); we lean on Mac-side alias expansion (§3) to cover service families like YouTube/Instagram without burning multiple slots.
+- `NSUbiquitousKeyValueStore` sync: **~1–2 s typical** for a remote write between iPhone and Mac (verified empirically Phase B). Apple docs say 10-20s, but that's worst-case under load. 1 MB total cap (we use ~5 KB).
 
-### macOS API facts
+### macOS NetworkExtension API facts (verified empirically)
 
-- `NEFilterDataProvider` runs as System Extension on macOS (not app extension); no supervision required.
-- `NEFilterDataProvider.flow.url` is **nil** for non-WebKit browsers — Chrome flows have no URL info.
-- `NEFilterDataProvider.flow.remoteEndpoint.hostname` returns hostname for Safari/Firefox/NSURLSession; returns IP for Chrome.
+- `NEFilterDataProvider` runs as a System Extension on macOS, NOT an app extension. Runs as **root (UID 0)** under its own per-root sandbox container at `/var/root/Library/Containers/<bundle-id>/`.
+- "Supervised device only" docs apply to iOS, NOT macOS.
+- **All TCP flows on Tahoe surface as `.ipv4` / `.ipv6` in `NEFilterSocketFlow.remoteFlowEndpoint`**, regardless of client (Safari, Chrome, Firefox, curl, NSURLSession). Kernel resolves DNS before flows reach the filter. The `.name` case in `handleNewFlow` essentially never fires. Hostname-based blocking goes through `handleOutboundData` SNI inspection.
+- `NEFilterDataProvider.flow.url` is `nil` for non-WebKit browsers — Chrome flows have no URL info.
+- **No retroactive kill API.** Once `handleNewFlow` or `handleOutboundData` returns `.allow()`, the flow detaches from the filter forever. `applySettings`, `handleRulesChanged`, `notifyRulesChanged`, `applyNewFilterRules`, and `resumeFlow` all only affect new or paused flows. Verified via `NEFilterDataProvider.h` and Apple DTS forum thread 735504. Workaround: keep flows under continuing data inspection via `NEFilterDataVerdict(passBytes: N, peekBytes: K)` from `handleOutboundData`. `peekBytes = Int.max` is the documented pattern (Apple forums) — system delivers in natural-sized TCP-segment chunks (~1-1.5 KB).
+- **App Group UserDefaults does not work for sysext↔container IPC.** The sysext (root, `~root` sandbox) and container (user 501, `~user` sandbox) resolve `UserDefaults(suiteName:)` to physically separate plists. Apple DTS (Quinn the Eskimo, threads 133543 + 763433) recommends NSXPCConnection instead. We use that.
+- `NEMachServiceName` MUST be prefixed with one of the App Groups in `com.apple.security.application-groups`. Sysextd's category-specific validator rejects mismatches with `NetworkExtensionErrorDomain Code=6`.
+- Apple Development cert provisioning profiles authorize `content-filter-provider` (legacy) but NOT `content-filter-provider-systemextension`. The latter is gated to Developer ID signing (distribution path).
+- `NEFilterDataVerdict.drop()` on a TCP flow PAUSES the flow indefinitely (per Apple DTS) rather than hard-closing it. Browsers see "no response" / connection timeout. Use `curl -v --max-time 8` for definitive verification (browsers may serve cached pages while connections stall).
 - `NEDNSProxyProvider` is bypassed by Chrome's DoH (default on in 2026) and by any DoH/DoT system DNS.
-- `EndpointSecurity` entitlement gated to security vendors — not available.
+- `EndpointSecurity` entitlement is gated to security vendors — not available to solo dev.
 - iCloud Private Relay routes Safari traffic invisibly to local content filters; **not relevant since user uses Chrome**.
-- Apple's `SimpleFirewall` (WWDC19) is the canonical NEFilterDataProvider sample.
+- Apple's `SimpleFirewall` (WWDC19) is the canonical NEFilterDataProvider sample. Uses NSXPCConnection over `NEMachServiceName` for container↔filter IPC — same pattern we use.
 - LuLu (https://github.com/objective-see/LuLu) is a production reference for NETransparentProxyProvider on macOS.
 - VPN install order matters: install filter BEFORE VPN client. Reverse may bypass.
 - SNI is plaintext in TLS ClientHello until ECH is widely deployed; ECH adoption among major distractor sites (Instagram, YouTube, X, Reddit, TikTok) is ~zero in 2026.
@@ -595,23 +689,32 @@ This is the canonical sysext UID split: even when the container correctly writes
 - ✅ QUIC blackhole still firing (12+ `flow DROP udp/443` log lines for instagram's HTTP/3 attempts before browser fell back to TCP+TLS).
 - ✅ `c5-verify.sh` reports **7/7 passed** for the full pipeline assertion set.
 
-**Pending (Phase D — Chrome SNI inspection)**: ✓ DONE (see above).
-
-**Phase E — Polish** (mixed status):
-1. ✅ SMAppService login-at-startup — `FoqosMac/LoginItem.swift`. Idempotent `SMAppService.mainApp.register()` from `FoqosMacApp.init`. Respects user disabling in System Settings (early-out on `.requiresApproval`).
-2. ✅ Custom AppIcon — Foqos's iOS marketing icon resized to all 10 macOS slots via `scripts/build-app-icons.sh` (sips). Generated PNGs committed to `FoqosMac/FoqosMac/Assets.xcassets/AppIcon.appiconset/`. Re-run the script after pulling fresh upstream Foqos assets.
-3. ✅ Menu bar icon — kept SF Symbols for theme-awareness + macOS convention. Three-state: `lock.fill` (blocked), `lock.open` (not blocking), `lock.slash` (emergency override active).
+**Done (Phase E — polish + filter robustness)** (commits `a8a406c`, `24239ce`, `920a0bb`, `2b55e1b`, plus the small comment fix in this commit):
+1. ✅ E1 — SMAppService login-at-startup. `FoqosMac/LoginItem.swift`. Idempotent `SMAppService.mainApp.register()` from `FoqosMacApp.init`. Respects user disabling in System Settings (early-out on `.requiresApproval`).
+2. ✅ E5 — Custom AppIcon. Foqos's iOS marketing icon resized to all 10 macOS slots via `scripts/build-app-icons.sh` (sips). Generated PNGs committed to `FoqosMac/FoqosMac/Assets.xcassets/AppIcon.appiconset/`. Re-run the script after pulling fresh upstream Foqos assets.
+3. ✅ E2 — Menu bar icon. Kept SF Symbols for theme-awareness + macOS convention. Three-state: `lock.fill` (blocked), `lock.open` (not blocking), `lock.slash` (emergency override active). Note: `BridgeState.isCurrentlyBlocking` factors in break/pause too (so the icon shows `lock.open` during a break, even though iCloud says `isBlocked=true`); the filter still receives the raw flags via `publishedBlocked` so it can do its own break/pause logic.
 4. ✅ `LSUIElement = YES` already done in C0.
-5. ✅ Emergency override (4-digit PIN in Keychain) — `FoqosMac/EmergencyOverride.swift`. Stored under service `com.usetessera.mybrick.emergency`, `kSecAttrAccessibleWhenUnlocked`. Constant-time PIN compare. UI integrated into ContentView mode state machine (`.main` ↔ `.settingPIN` ↔ `.enteringPIN`). Engaging override forces `effectiveBlocked = false` in `BridgeState.publishEffectiveState()`; auto-lifts on the next material iCloud transition (any of `isBlocked`/break/pause/`domains`/`activeProfileId` changes vs. the snapshot taken at engage time). Local-only — never written to iCloud per §6.
-6. ✅ ContentView UX overhaul — single-line top status combines block/break/pause/override; dropped `isBlocked`/`isBreakActive`/`isPauseActive`/`Profile` rows; domain count line replaces the (truncated) domain list; removed `Force sync` (kept `Quit`); `Synced X:XX` footer.
-7. ⏳ **Phase F: Distribution** — TestFlight for iPhone (Foqos fork) + Developer ID + notarize for Mac. Friend doesn't need their own paid Dev account; user uploads iPhone build to App Store Connect → invites by email; user notarizes Mac .app and ships .dmg. Per §6's switch-when-distributing note: must move Mac filter entitlement from `content-filter-provider` (legacy / Apple Development cert) to `content-filter-provider-systemextension` (Developer ID). Recipe + docs to land in §18.
+5. ✅ E3 — Emergency override (4-digit PIN in Keychain). `FoqosMac/EmergencyOverride.swift`. Stored under service `com.usetessera.mybrick.emergency`, `kSecAttrAccessibleWhenUnlocked`. Constant-time PIN compare. UI integrated into ContentView mode state machine (`.main` ↔ `.settingPIN` ↔ `.enteringPIN`). Engaging override forces `BridgeState.publishedBlocked = false` in `publishEffectiveState()`; auto-lifts on the next material iCloud transition (any of `isBlocked` / break / pause / `domains` / `activeProfileId` changes vs. the snapshot taken at engage time). Local-only — never written to iCloud per §6.
+6. ✅ ContentView UX overhaul — single-line top status combines block / break / pause / override; dropped `isBlocked` / `isBreakActive` / `isPauseActive` / `Profile` rows; domain-count line replaces the (truncated) domain list; removed `Force sync` (kept `Quit`); `Synced X:XX` footer.
+7. ✅ Filter behavior on state transitions — see §3 "Filter behavior on state transitions." `FilterDataProvider` now keeps every TLS flow under continuing inspection (`peekBytes = Int.max`) instead of returning `.allow()` and detaching. Existing TCP connections die on the next outbound chunk after a state change (break end, rebrick, blocklist mutation). Necessary because `NEFilterDataProvider` has no retroactive kill API for `.allow()`d flows; verified via Apple headers + DTS forum thread 735504. Cost: 0% idle, ~0.05% on a 5 Mbps stream, ~0.25% on 25 Mbps 4K — below the noise floor on M2 Air.
+8. ✅ Alias expansion in `BlocklistState.domainAliases` — see §3 "Alias expansion." Profile entries `youtube.com` and `instagram.com` expand to their full service-domain set so the user enters one canonical SLD per service and the Mac filter handles per-service coverage. Conservative inclusion criteria; `ggpht.com` / `googleapis.com` / `fbcdn.net` deliberately excluded (over-block adjacent services).
 
-### Cross-cutting learnings from Phase C, D, C5 (preserve for future sessions)
+**Pending (Phase F: distribution)**:
+- TestFlight for iPhone (Foqos fork) — friend installs via TestFlight invite, no paid Dev account on their side. Builds expire after 90 days; you re-upload periodically.
+- Developer ID + notarize for Mac — switch Release signing from Apple Development → Developer ID Application; switch NE entitlement from `content-filter-provider` → `content-filter-provider-systemextension` for Release builds; build → `xcrun notarytool submit --wait` → `xcrun stapler staple` → ship .dmg.
+- Self-deploy script `scripts/deploy-mac.sh` — wraps `xcodebuild` + `ditto /Applications` + relaunch.
+- Parameterized share recipe — extend `apply-mybrick-overrides.sh` to take `TEAM_ID` + `BUNDLE_PREFIX` so a friend with their own paid Dev account could fork-and-build (alternative path to TestFlight).
+- Documentation: §18 "Distribution & sharing."
 
-- **macOS Tahoe 26.3 surfaces ALL flows as IP, not hostname.** The CLAUDE.md §3 "hostname for Safari/Firefox/NSURLSession" line is outdated. Even Safari traffic shows `.ipv4`/`.ipv6` cases on `NEFilterSocketFlow.remoteFlowEndpoint`, never `.name`. Kernel resolves DNS before flows reach the filter. Hostname-string matching from `handleNewFlow` essentially never fires. **All blocking goes through `handleOutboundData` SNI inspection.** Phase D became the actual functional path, not a Chrome-only optimization.
+### Cross-cutting learnings (preserve for future sessions)
+
+- **macOS Tahoe 26.3 surfaces ALL flows as IP, not hostname.** Every TCP flow shows `.ipv4` / `.ipv6` on `NEFilterSocketFlow.remoteFlowEndpoint`, never `.name` — regardless of client (Safari, Chrome, Firefox, curl, NSURLSession). Kernel resolves DNS before flows reach the filter. Hostname matching from `handleNewFlow` essentially never fires. **All blocking goes through `handleOutboundData` SNI inspection.** Phase D became the actual functional path, not a Chrome-only optimization.
+- **NEFilterDataProvider has no retroactive kill API for `.allow()`d flows.** Verified via `NEFilterDataProvider.h` and Apple DTS forum thread 735504 (*"once I return an allow/deny verdict for the flow … do I no longer see that flow's traffic in my content filter? — Correct."*). `applySettings`, `handleRulesChanged`, `notifyRulesChanged`, `applyNewFilterRules`, `resumeFlow` all only affect new or paused flows. Workaround: never return `.allow()` from `handleOutboundData` for TLS flows; instead return `NEFilterDataVerdict(passBytes: N, peekBytes: Int.max)` to keep the flow under continuing inspection. State changes propagate on the next outbound chunk.
+- **`peekBytes = Int.max` is the right choice for continuing TLS inspection.** Apple's forum-documented pattern. System delivers in natural-sized TCP-segment chunks (~1-1.5 KB) rather than buffering up to a fixed threshold. Matters for HTTP/2 control plane: with `peekBytes = 64 KB`, a browsing session can fire dozens of small request headers before our callback wakes up — state-change reaction is effectively never. With `Int.max`, every TCP segment fires a callback and reaction is bounded by user activity.
+- **Service-domain alias expansion is needed because canonical SLDs don't suffix-match service CDNs.** `youtube.com` only matches `*.youtube.com` — NOT `googlevideo.com` (where YouTube actually streams its videos). Without expansion, blocking `youtube.com` lets video chunks load freely on existing tabs. Expansion happens in `BlocklistState.domainAliases` at update time. Conservative criteria: an alias domain is included only if exclusively (or near-exclusively) used by the named service. `ggpht.com` / `googleapis.com` / `fbcdn.net` deliberately excluded (over-block adjacent services). To extend: add a new mapping; no iOS-profile rebuild needed.
 - **Apple Development cert profiles authorize `content-filter-provider` (legacy), NOT `content-filter-provider-systemextension`.** The `-systemextension` suffix is gated to Developer ID signing. Xcode's "+ Capability → Network Extensions → Content Filter" UI also writes the legacy value. To ship eventually we'd need Developer ID. For dev: use legacy.
 - **`NEMachServiceName` MUST be prefixed with one of the App Groups** in `com.apple.security.application-groups`. Sysextd's category-specific validator returns `NetworkExtensionErrorDomain Code=6` if not. Our App Group is `group.com.usetessera.mybrick` (literal `group.` prefix, not team-prefixed) so the Mach service is `group.com.usetessera.mybrick.FoqosMacFilter`. Apple's SimpleFirewall sample team-prefixes BOTH (App Group is `$(TeamIdentifierPrefix)<bundle-id>`); we can't follow that pattern because iOS Foqos uses the `group.` form.
-- **Darwin notification names from sandboxed processes MUST be prefixed with the App Group.** Was `com.usetessera.mybrick.state.changed`, fixed to `group.com.usetessera.mybrick.state.changed`. Sandbox silently drops mismatched notifications.
+- **Darwin notification names from sandboxed processes MUST be prefixed with the App Group.** Was `com.usetessera.mybrick.state.changed`, fixed to `group.com.usetessera.mybrick.state.changed`. Sandbox silently drops mismatched notifications. (Historical — Darwin notifications are no longer used since the C5 XPC pivot, but the rule is still relevant if anyone ever reaches for them.)
 - **Same-version replace doesn't always trigger `actionForReplacingExtension`.** OS may consider `(bundleID, CFBundleVersion)` already-installed and skip the replace path even if the new binary's cdhash differs. Solution: use `date +%s` (epoch seconds) as `CURRENT_PROJECT_VERSION` for every dev build — guaranteed unique. `scripts/dev-iterate.sh` and `scripts/c5-verify.sh` do this with bump-then-revert so working tree stays clean.
 - **`NEFilterDataVerdict.drop()` on a TCP flow PAUSES the flow indefinitely** rather than hard-closing it. Per Apple DTS. The TLS handshake can't proceed; client eventually times out. Browsers may serve cached pages while the connection stalls — this is why early "example.com still loads in Chrome" was misleading. Use `curl -v --max-time 8` for definitive verification (no cache, single connection per attempt).
 - **`/Applications` is required for sysext install on macOS Tahoe 26**, even with `systemextensionsctl developer on`. The `developer on` mode relaxes signing checks but NOT the location requirement. All dev iteration must deploy to `/Applications/FoqosMac.app` before `OSSystemExtensionRequest` will succeed.
@@ -660,9 +763,16 @@ The Claude environment has filesystem write restrictions:
 
 ## 14. Reference architectures (for code lifts)
 
-- Apple's `SimpleFirewall` — minimal NEFilterDataProvider sample. WWDC 2019 session 714. Search "SimpleFirewall site:developer.apple.com".
-- LuLu by Patrick Wardle — production NETransparentProxyProvider on macOS. https://github.com/objective-see/LuLu. Useful: entitlements plist, System Extension activation flow, App Group IPC pattern. NOT useful: hostname-from-flow logic (LuLu doesn't do SNI inspection — they accept the IP-only limitation for Chrome).
-- For TLS ClientHello SNI parsing in Swift: ~50 LOC, well-documented. Multiple open-source TLS parsers to copy from. The TLS ClientHello structure is in RFC 8446 §4.1.2. SNI extension is RFC 6066 §3.
+- Apple's `SimpleFirewall` — minimal NEFilterDataProvider sample. WWDC 2019 session 714. Uses NSXPCConnection over `NEMachServiceName` for container↔filter IPC — same pattern as us. Search "SimpleFirewall site:developer.apple.com".
+- Apple Developer Forums threads (Quinn the Eskimo) for sysext IPC + filter behavior:
+  - 763433 — "App groups aren't as useful in a sysex" (canonical UID-split quote).
+  - 133543 — "use XPC instead of App Group containers" recommendation.
+  - 706503 — `/var/root/Library/Containers` + sysext sandbox.
+  - 735504 — "once I return allow/deny … do I no longer see traffic? Correct" (no-retroactive-kill API confirmation).
+  - 750912 — "Data storage for Network Extension" — `notifyRulesChanged()` / `handleRulesChanged()` mechanism (not used here; only affects new flows).
+  - 721701 — "App Groups: macOS vs iOS: Fight!" (iOS-style `group.X` vs macOS-style `<TeamID>.X` naming; both supported on macOS as of Feb 2025).
+- LuLu by Patrick Wardle — production NETransparentProxyProvider on macOS. https://github.com/objective-see/LuLu. Useful: entitlements plist, System Extension activation flow. NOT useful for our specific patterns: LuLu doesn't do SNI inspection (it accepts the IP-only limitation), and doesn't keep flows under continuing inspection for retroactive kill.
+- For TLS ClientHello SNI parsing in Swift: `FoqosMacFilter/SNIParser.swift` is the local reference (~120 LOC, bounds-checked Cursor pattern, golden-vector test in `SNIParserSanityCheck`). The TLS ClientHello structure is in RFC 8446 §4.1.2 (TLS 1.3) and RFC 5246 §7.4.1.2 (TLS 1.2); SNI extension is RFC 6066 §3.
 
 ---
 
@@ -685,16 +795,27 @@ open FoqosMac.xcodeproj
 # First run prompts for System Extension approval
 ```
 
-### Verifying the iCloud bridge
+### Verifying the full pipeline
 
-**Easiest path: use FoqosMac itself** (Phase B onwards). Run FoqosMac from Xcode (`⌘R`). The menu bar dropdown shows live state. Brick on iPhone → menu bar lock icon flips within ~1–2s.
+**Best path: `scripts/c5-verify.sh`** — see §16. It builds, deploys to `/Applications`, asserts the XPC handshake, runs curl tests against the iPhone-bricked-domain (when `TEST_BLOCKED_DOMAIN` is set), and dumps a verdict. 6/6 baseline; 7/7 with the real-iPhone test.
 
-**Alternate: Xcode debug console** (more diagnostic detail). With the Foqos iOS app or FoqosMac app running from Xcode and the debugger attached:
-- Filter the Xcode debug area on `iCloudBridge` (iOS) or `ICloudObserver` (Mac)
-- iOS side: NFC scan → `sessionStarted profile=… domains=…`
-- Mac side: NFC scan → `External change reason=0 keys=[mybrick.isBlocked, …]`
+**Live diagnostic stream** during interactive testing:
 
-⚠️ **Console.app is NOT a reliable verification path.** Console.app on macOS Tahoe filters out `os_log` Info messages from physical iPhones inconsistently even with "Include Info Messages" enabled. The iOS debugging story always works through Xcode's debug area when the debugger is attached. Once Xcode says "Finished running", the debug console stops capturing — must re-`⌘R`.
+```bash
+log stream --predicate "subsystem == 'com.usetessera.mybrick'" --info --debug --style compact
+```
+
+Categories worth grepping:
+- `IPCClient`, `IPCService` — XPC handshake events (publish, retry, listener accept).
+- `BlocklistState` — `Updated:` lines when a fresh snapshot arrives. The `effectiveDomains=N` part includes alias expansion.
+- `FilterDataProvider` — `SNI watch <host>` (kept under inspection), `SNI DROP <host>` (first-flow drop), `SNI DROP <host> [retroactive — state changed, bytes=N]` (continuing-inspection drop), `flow DROP udp/443` (QUIC blackhole), `SNI nil` (couldn't parse — usually mDNS or TLS resumption).
+- `ExtensionActivator` — startup activation lifecycle (`Replacing existing extension`, `Filter active and enabled`).
+- `LoginItem` — at-launch login-item registration.
+- `EmergencyOverride` — PIN-set / PIN-verify events.
+
+⚠️ **Always include `--info --debug`** in `log show` / `log stream` predicates. `Logger.info` messages are filtered out by default; without these flags it'll look like the filter isn't running when it just isn't logging at the visible level.
+
+⚠️ **Console.app is NOT a reliable verification path.** Console.app on macOS Tahoe filters out `os_log` Info messages from physical iPhones inconsistently even with "Include Info Messages" enabled. iOS debugging story works through Xcode's debug area when the debugger is attached.
 
 ---
 
@@ -710,17 +831,24 @@ One-shot dev iteration loop. Bumps `CURRENT_PROJECT_VERSION`, builds via xcodebu
 Use when: making code changes during active dev, want to see live logs while testing.
 
 ### `scripts/c5-verify.sh`
-End-to-end verification with bump→build→deploy→inject-synthetic-state→curl-test→capture-logs→verdict. Bumps version to `date +%s` (always unique, forces OS replace). Tests 6 assertions:
-1. Empty App Group → example.com works
-2. `{isBlocked:true, domains:[example.com]}` → example.com blocked
-3. `{isBlocked:true, isBreakActive:true, ...}` → example.com works (break suspends)
-4. Subdomain match: `www.example.com` blocked when domains contains `example.com`
-5. `{isBlocked:false, ...}` → example.com works
-6. Implicit: `google.com` works in all states
+End-to-end verification with bump→build→deploy→XPC-handshake-check→curl-tests→capture-logs→verdict. Bumps `CURRENT_PROJECT_VERSION` to `date +%s` (always unique, forces OS replace). Reverts pbxproj at end so working tree stays clean. Asserts:
+1. Filter listener started (XPC `IPCService` log).
+2. Filter accepted client connection.
+3. Filter received at least one snapshot from the container.
+4. Container published at least one snapshot (XPC `IPCClient` log).
+5. `BlocklistState.update` happened (snapshot reached the matching engine).
+6. `curl https://www.apple.com` → 200 (filter not blackholing).
+7. (Optional) `curl https://$TEST_BLOCKED_DOMAIN` → connection failure when env var is set and the iPhone is bricked with that domain in its profile.
 
-Output: `scripts/c5-verify.out` with a clear PASS/FAIL verdict and full diagnostic logs (FilterDataProvider, BlocklistState, ExtensionActivator, AppGroupBridge categories).
+Output: `scripts/c5-verify.out` with a clear PASS/FAIL verdict and full diagnostic logs (FilterDataProvider, BlocklistState, IPCService, IPCClient, ExtensionActivator categories).
 
-Currently 7/7 passing (post-XPC pivot, with `TEST_BLOCKED_DOMAIN=instagram.com` set and the iPhone bricked).
+Currently passes 6/6 with no env var, 7/7 with `TEST_BLOCKED_DOMAIN=instagram.com` and the iPhone bricked.
+
+### `scripts/c5-lsof-check.sh`
+One-shot diagnostic that captures verbatim evidence of the sysext UID-split (filter PID's UID + cwd + open files; user-side vs root-side App Group container paths). Used to ground-truth the Phase C5 BLOCKER hypothesis before pivoting to XPC. Output goes to `scripts/c5-lsof-check.out`. Useful as historical evidence in commit messages; rarely needs to be re-run unless someone questions the diagnosis.
+
+### `scripts/build-app-icons.sh`
+Resizes Foqos's iOS marketing AppIcon (1024×1024) into all 10 macOS slot sizes via `sips` and writes them to `FoqosMac/FoqosMac/Assets.xcassets/AppIcon.appiconset/`. Generated PNGs are committed; re-run after pulling fresh upstream Foqos icons.
 
 ### `scripts/c4-verify.sh`, `scripts/c4-test.sh`
 Earlier verification scripts kept as historical reference for the C4/D pipeline-only test. Superseded by `c5-verify.sh` for ongoing dev verification but useful diagnostic tools if filter pipeline ever regresses.
@@ -746,61 +874,96 @@ Continuing the MyBrick / FoqosUp project at ~/projects/FoqosUp/.
 
 STEP 1: read CLAUDE.md in full. SSOT. Most important sections:
   - §1 (project intent — cooperative self-blocking; iPhone NFC bricks Mac too)
-  - §11 "Where we are right now" — execution state through Phase C5 (XPC)
-  - §11 "Phase C5 root cause" — the UID-split diagnostic + DTS quotes
+  - §3 (architecture — high-level flow, hostname problem, IPC, filter
+    behavior on state transitions, alias expansion)
+  - §6 (Mac app architecture — current target layout post-Phase E)
+  - §11 (execution state — every phase commit-by-commit)
   - §11 cross-cutting learnings — failure modes already discovered
-  - §6 macOS Mac app architecture
-  - §16 dev workflow scripts
+  - §14 (reference architectures — Apple DTS forum threads to consult)
+  - §16 (dev workflow scripts)
 
 STEP 2: confirm state via git log.
-  cd ~/projects/FoqosUp && git log --oneline -15
+  cd ~/projects/FoqosUp && git log --oneline -25
 
-  Most recent commit should be the C5 XPC pivot. Earlier commits (Phase D,
-  C4, C3, C2, C1, C0, Phase B, Phase A) are documented in §11.
+  All phases A → E complete. Most recent commits should be the Phase E
+  filter-robustness work (peekBytes=Int.max, watch-all-flows, alias
+  expansion). Phase F (distribution) is the next major chunk.
 
 STEP 3: where things stand.
 
-WHAT WORKS (verified end-to-end through Phase D, C5 verification next):
-  - iCloud bridge iOS↔Mac (Phase A+B): brick iPhone → Mac dropdown shows
-    isBlocked=true, domains=[instagram.com], in 1-2s.
-  - System Extension install + activation (Phase C1-C4).
-  - SNI parser + drop pipeline (Phase D): hostname-based blocking via TLS
-    ClientHello inspection from handleOutboundData. QUIC blackhole forces
-    TCP+TLS fallback for HTTP/3 clients.
-  - Container ↔ filter IPC via NSXPCConnection (Phase C5): container's
+WHAT WORKS (all verified end-to-end, c5-verify.sh 6/6 baseline + 7/7
+with TEST_BLOCKED_DOMAIN=instagram.com):
+  - iCloud bridge iOS↔Mac (Phase A+B): brick iPhone → Mac dropdown
+    shows isBlocked=true, domains=..., within ~1-2 s.
+  - System Extension install + activation (Phase C0-C4).
+  - SNI inspection + drop (Phase D): hostname-based blocking via TLS
+    ClientHello inspection. QUIC blackhole forces TCP+TLS fallback for
+    HTTP/3.
+  - Container↔filter IPC via NSXPCConnection (Phase C5): container's
     BridgeState.refresh() pushes JSON-encoded BlocklistSnapshot through
-    IPCClient → filter's IPCService → BlocklistState.update(). Replaces the
-    earlier App Group UserDefaults + Darwin design which was unrecoverable
-    due to the sysext UID split (filter runs as root, sees /var/root/...;
-    container runs as user, writes to /Users/.../). DTS-confirmed; lsof
-    evidence in commit body.
+    IPCClient → filter's IPCService → BlocklistState.update(). Replaced
+    the earlier App Group UserDefaults + Darwin design which is
+    unworkable due to the sysext UID split. See §11 "Phase C5 root cause"
+    for verbatim lsof + DTS evidence.
+  - State-change reactivity (Phase E filter robustness): existing TLS
+    flows die on the next outbound chunk after a state change (break
+    end, rebrick, blocklist mutation). Achieved by keeping every TLS
+    flow under continuing data inspection (peekBytes=Int.max) instead
+    of returning .allow() and detaching. NEFilterDataProvider has no
+    retroactive kill API for already-allowed flows; this is the only
+    workaround.
+  - Alias expansion (Phase E): user enters `youtube.com` in iOS
+    profile, Mac filter expands to {youtube.com, googlevideo.com,
+    ytimg.com, youtu.be, youtube-nocookie.com}. Same for instagram.com
+    → {instagram.com, cdninstagram.com}.
+  - Login at startup (Phase E1): SMAppService.mainApp.register() from
+    FoqosMacApp.init().
+  - Emergency PIN override (Phase E3): local Keychain PIN; engaging
+    forces filter to isBlocked=false; auto-lifts on next iCloud
+    transition.
+  - Custom AppIcon: Foqos's iOS marketing icon resized to all 10 macOS
+    slot sizes via scripts/build-app-icons.sh.
 
-WHAT'S NEXT (Phase E — polish, see §11):
-  - SMAppService login-at-startup
-  - Custom menu bar icon
-  - Emergency override (Keychain PIN)
-  - Notarize for personal use
-  - Custom AppIcon
+WHAT'S NEXT (Phase F — distribution, the only major chunk left):
+  - TestFlight for iPhone (Foqos fork): friends install via TestFlight
+    invite, no paid Dev account on their side, builds expire at 90 days.
+  - Developer ID + notarize for Mac: switch Release signing from Apple
+    Development → Developer ID Application; flip NE entitlement to
+    `content-filter-provider-systemextension` for Release; build →
+    notarytool submit → stapler staple → ship .dmg. Friends drag to
+    /Applications, approve sysext once. iCloud KV namespace is your
+    team-prefixed value; each friend signs in with their own iCloud,
+    so per-friend state is isolated.
+  - scripts/deploy-mac.sh: thin wrapper for self-deploy (xcodebuild →
+    ditto /Applications → relaunch).
+  - Parameterized share recipe: extend apply-mybrick-overrides.sh to
+    take TEAM_ID + BUNDLE_PREFIX env vars for a friend who has their
+    own paid Dev account and wants to fork-and-build instead of
+    accepting a TestFlight build.
+  - CLAUDE.md §18: distribution & sharing process docs.
 
 OPERATIONAL RULES:
-  - Senior-SWE rigor bar: clean modular code, ground-truth research before
-    pivoting, document trade-offs in commit messages, verbatim diagnostic
-    evidence in commit bodies (the C5 commit shows the pattern).
-  - Sandbox blocks xcodebuild, log show, /Applications writes, sudo from
-    Claude's environment. User runs scripts; Claude reads .out files.
-    Don't ask the user to do things Claude can do itself (file edits).
+  - Senior-SWE rigor bar: clean modular code, ground-truth research
+    before pivoting, document trade-offs in commit messages, verbatim
+    diagnostic evidence in commit bodies (the C5 commit shows the
+    pattern).
+  - Sandbox blocks xcodebuild, log show, /Applications writes, and
+    sudo from Claude's environment. User runs scripts; Claude reads
+    .out files. Don't ask the user to do things Claude can do itself.
   - Be terse. Test before claiming. Trust git log.
   - SIP is ON, dev-mode is OFF. /Applications deployment + Apple
-    Development cert is the dev path. .replace verdict in
+    Development cert is the dev path. `.replace` verdict in
     actionForReplacingExtension handles cdhash-different rebuilds; old
     extension versions pile up as "terminated waiting to uninstall on
     reboot" until reboot.
-  - When in doubt about libraries / Apple APIs, prefer context7 or
-    Apple Developer Forums (Quinn the Eskimo's threads are gold) over
-    web search.
+  - When in doubt about Apple APIs, prefer Apple Developer Forums
+    (Quinn the Eskimo's threads — see §14) over web search.
+  - When asked "would you 100% approve this?", critique honestly,
+    push back on premature optimization, distinguish must-have from
+    nice-to-have.
 ```
 
 ---
 
 **Last fork sync**: Foqos 1.32.4 (commit `5ac998f`, 2026)
-**Document version**: 2026-05-01 — Phases A through D, C5, C6 all complete. C5 pivoted from App Group UserDefaults → NSXPCConnection after confirming the sysext UID-split; C6 verified by `scripts/c5-verify.sh` 7/7 with real iPhone state. Phase E (polish) pending.
+**Document version**: 2026-05-01 — Phases A through E all complete (login-at-startup, AppIcon, dropdown UX, emergency PIN, filter state-transition reactivity, service-domain alias expansion). c5-verify.sh 6/6 baseline + 7/7 with real iPhone state. Phase F (distribution: TestFlight + notarize + deploy script + parameterized share recipe) is the only remaining major work item.
