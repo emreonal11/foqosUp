@@ -597,13 +597,14 @@ This is the canonical sysext UID split: even when the container correctly writes
 
 **Pending (Phase D — Chrome SNI inspection)**: ✓ DONE (see above).
 
-**Pending (Phase E — Polish)**:
-1. SMAppService login-at-startup (`SMAppService.mainApp.register()`)
-2. Custom menu bar icon (currently uses SF Symbol `lock.fill` / `lock.open`)
-3. ✓ `LSUIElement = YES` already done in C0
-4. Emergency override (4-digit PIN in Keychain, local-only, doesn't write to iCloud — see §6)
-5. Notarize for personal use (avoids Gatekeeper warnings on rebuild). Also: Developer ID signing required for `-systemextension` entitlement variant.
-6. Custom AppIcon (currently default Xcode template)
+**Phase E — Polish** (mixed status):
+1. ✅ SMAppService login-at-startup — `FoqosMac/LoginItem.swift`. Idempotent `SMAppService.mainApp.register()` from `FoqosMacApp.init`. Respects user disabling in System Settings (early-out on `.requiresApproval`).
+2. ✅ Custom AppIcon — Foqos's iOS marketing icon resized to all 10 macOS slots via `scripts/build-app-icons.sh` (sips). Generated PNGs committed to `FoqosMac/FoqosMac/Assets.xcassets/AppIcon.appiconset/`. Re-run the script after pulling fresh upstream Foqos assets.
+3. ✅ Menu bar icon — kept SF Symbols for theme-awareness + macOS convention. Three-state: `lock.fill` (blocked), `lock.open` (not blocking), `lock.slash` (emergency override active).
+4. ✅ `LSUIElement = YES` already done in C0.
+5. ✅ Emergency override (4-digit PIN in Keychain) — `FoqosMac/EmergencyOverride.swift`. Stored under service `com.usetessera.mybrick.emergency`, `kSecAttrAccessibleWhenUnlocked`. Constant-time PIN compare. UI integrated into ContentView mode state machine (`.main` ↔ `.settingPIN` ↔ `.enteringPIN`). Engaging override forces `effectiveBlocked = false` in `BridgeState.publishEffectiveState()`; auto-lifts on the next material iCloud transition (any of `isBlocked`/break/pause/`domains`/`activeProfileId` changes vs. the snapshot taken at engage time). Local-only — never written to iCloud per §6.
+6. ✅ ContentView UX overhaul — single-line top status combines block/break/pause/override; dropped `isBlocked`/`isBreakActive`/`isPauseActive`/`Profile` rows; domain count line replaces the (truncated) domain list; removed `Force sync` (kept `Quit`); `Synced X:XX` footer.
+7. ⏳ **Phase F: Distribution** — TestFlight for iPhone (Foqos fork) + Developer ID + notarize for Mac. Friend doesn't need their own paid Dev account; user uploads iPhone build to App Store Connect → invites by email; user notarizes Mac .app and ships .dmg. Per §6's switch-when-distributing note: must move Mac filter entitlement from `content-filter-provider` (legacy / Apple Development cert) to `content-filter-provider-systemextension` (Developer ID). Recipe + docs to land in §18.
 
 ### Cross-cutting learnings from Phase C, D, C5 (preserve for future sessions)
 

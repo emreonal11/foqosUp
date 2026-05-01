@@ -4,6 +4,10 @@ import SwiftUI
 struct FoqosMacApp: App {
   @StateObject private var bridge = BridgeState()
 
+  init() {
+    LoginItem.ensureRegistered()
+  }
+
   var body: some Scene {
     MenuBarExtra {
       ContentView()
